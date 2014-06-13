@@ -298,8 +298,8 @@ role STD {
                     # Add mention-only record (used to poison outer
                     # usages and disambiguate hashes/blocks by use of
                     # $_ when $*IMPLICIT is in force).
-                    $lex<also_uses> := {} unless $lex<also_uses>;
-                    $lex<also_uses>{$name} := 1;
+                    $lex.ann('also_uses', {}) unless $lex.ann('also_uses');
+                    nqp::bindkey($lex.ann('also_uses'), $name, 1);
                 }
             }
         }
@@ -939,11 +939,11 @@ grammar Perl6::Grammar is HLL::Grammar does STD {
             # our setting. Otherwise, load one.
             my $have_outer := nqp::defined(%*COMPILING<%?OPTIONS><outer_ctx>);
             if $have_outer {
-                $*UNIT<IN_DECL> := 'eval';
+                $*UNIT.ann('IN_DECL', 'eval');
             }
             else {
                 $*SETTING := $*W.load_setting($/, %*COMPILING<%?OPTIONS><setting> // 'CORE');
-                $*UNIT<IN_DECL> := 'mainline';
+                $*UNIT.ann('IN_DECL', 'mainline');
             }
             $/.CURSOR.unitstart();
             try {
