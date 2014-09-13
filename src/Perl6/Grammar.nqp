@@ -2920,7 +2920,16 @@ grammar Perl6::Grammar is HLL::Grammar does STD {
     proto rule trait_mod { <...> }
     rule trait_mod:sym<is>      { <sym> <longname><circumfix>**0..1 }
     rule trait_mod:sym<hides>   { <sym> <typename> }
-    rule trait_mod:sym<does>    { <sym> <typename> }
+    token trait_mod:sym<does>    {
+        <.ws> <sym> <.ws>
+        [
+            <typename>
+            || [
+                [ <typo_typename>  ]
+            ] <!>
+        ]
+        <.ws>
+    }
     rule trait_mod:sym<will>    { <sym> <identifier> <pblock> }
     rule trait_mod:sym<of>      { <sym> <typename> }
     rule trait_mod:sym<as>      { <sym> <typename> }
