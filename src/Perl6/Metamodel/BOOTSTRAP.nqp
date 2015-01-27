@@ -2645,13 +2645,14 @@ BEGIN {
                 my $coercer_name := $self.HOW.name($self);
                 nqp::die("Cannot coerce to $coercer_name with named parameters")
                   if +%named;
+                my $coerce :=  nqp::getlexcaller('&COERCE');
                 if +@pos == 1 {
-                    @pos[0]."$coercer_name"()
+                    $coerce(@pos[0], $self, |%named);
                 }
                 else {
                     my $parcel := nqp::create(Parcel);
                     nqp::bindattr($parcel, Parcel, '$!storage', @pos);
-                    $parcel."$coercer_name"()
+                    $coerce($parcel, $self, |%named);
                 }
             }
             else {

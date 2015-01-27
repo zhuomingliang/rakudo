@@ -821,6 +821,14 @@ sub DUMP(|args (*@args, :$indent-step = 4, :%ctx?)) {
     }
 }
 
+proto sub COERCE($, $) { * }
+
+multi sub COERCE(Any $src, Any:U $dest) {
+    my $dest_method = $dest.^name;
+
+    return $src."$dest_method"();
+}
+
 Metamodel::ClassHOW.exclude_parent(Mu);
 
 # vim: ft=perl6 expandtab sw=4
