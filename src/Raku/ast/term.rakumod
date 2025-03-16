@@ -15,9 +15,12 @@ class RakuAST::Term::Name
         $obj
     }
 
-    method attach(RakuAST::Resolver $resolver) {
-        my $package := $resolver.find-attach-target('package');
-        nqp::bindattr(self, RakuAST::Term::Name, '$!package', $package);
+    method has-compile-time-value() {
+        self.is-resolved && self.resolution.has-compile-time-value
+    }
+
+    method maybe-compile-time-value() {
+        self.resolution.compile-time-value
     }
 
     method PERFORM-PARSE(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
@@ -53,12 +56,8 @@ class RakuAST::Term::Name
             $!name.IMPL-QAST-PSEUDO-PACKAGE-LOOKUP($context);
         }
         elsif $!name.is-package-lookup {
-            return self.is-resolved
-                ?? $!name.IMPL-QAST-PACKAGE-LOOKUP(
-                    $context,
-                    $!package,
-                    :lexical(self.resolution)
-                )
+            return self.is-resolved && !$!name.is-global-lookup
+                ?? QAST::Op.new(:op<who>, self.resolution.IMPL-LOOKUP-QAST($context))
                 !! $!name.IMPL-QAST-PACKAGE-LOOKUP(
                     $context,
                     $!package
@@ -70,6 +69,14 @@ class RakuAST::Term::Name
         else {
             self.resolution.IMPL-LOOKUP-QAST($context)
         }
+    }
+
+    method IMPL-CAN-INTERPRET() {
+        self.has-compile-time-value
+    }
+
+    method IMPL-INTERPRET(RakuAST::IMPL::InterpContext $ctx) {
+        self.maybe-compile-time-value
     }
 
     method visit-children(Code $visitor) {
@@ -102,8 +109,12 @@ class RakuAST::Term::Self
   is RakuAST::ParseTime
   is RakuAST::CheckTime
 {
-    method new() {
-        nqp::create(self)
+    has RakuAST::Var::Attribute::Public $!variable;
+
+    method new(RakuAST::Var::Attribute::Public :$variable) {
+        my $obj := nqp::create(self);
+        nqp::bindattr($obj, RakuAST::Term::Self, '$!variable', $variable // RakuAST::Var::Attribute::Public);
+        $obj
     }
 
     method PERFORM-PARSE(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
@@ -115,7 +126,17 @@ class RakuAST::Term::Self
 
     method PERFORM-CHECK(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         unless self.is-resolved {
-            self.add-sorry($resolver.build-exception('X::Syntax::Self::WithoutObject'))
+            my $resolved := $resolver.resolve-lexical('self');
+            if $resolved {
+                self.set-resolution($resolved);
+            }
+            else {
+                self.add-sorry(
+                    $!variable
+                        ?? $resolver.build-exception('X::Syntax::NoSelf', :variable($!variable.name))
+                        !! $resolver.build-exception('X::Syntax::Self::WithoutObject')
+                )
+            }
         }
     }
 

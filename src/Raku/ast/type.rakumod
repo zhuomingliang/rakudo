@@ -76,6 +76,8 @@ class RakuAST::Type::Simple
   is RakuAST::Lookup
 {
     has RakuAST::Name $.name;
+    has Mu $!package;
+    has RakuAST::Node $!lexical;
 
     method new(RakuAST::Name $name) {
         my $obj := nqp::create(self);
@@ -89,9 +91,17 @@ class RakuAST::Type::Simple
     }
 
     method PERFORM-PARSE(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
+        nqp::bindattr(self, RakuAST::Type::Simple, '$!package', $resolver.current-package);
         my $resolved := $resolver.resolve-name-constant(self.name);
         if $resolved {
             self.set-resolution($resolved);
+        }
+        my $value := $resolved.compile-time-value;
+        if !$value.HOW.archetypes.generic && $!name.is-multi-part && nqp::istype($value.HOW, Perl6::Metamodel::PackageHOW) {
+            my $resolved := $resolver.resolve-lexical-constant($!name.parts.AT-POS(0).name);
+            if $resolved {
+                nqp::bindattr(self, RakuAST::Type::Simple, '$!lexical', $resolved);
+            }
         }
     }
 
@@ -103,6 +113,10 @@ class RakuAST::Type::Simple
         my $value := self.resolution.compile-time-value;
         if $value.HOW.archetypes.generic {
             QAST::Var.new( :name($!name.canonicalize), :scope('lexical') )
+        }
+        elsif $!name.is-multi-part && nqp::istype($value.HOW, Perl6::Metamodel::PackageHOW) {
+            # Package stub could be replaced later, thus we need to look it up at runtime.
+            $!name.IMPL-QAST-PACKAGE-LOOKUP($context, $!package, :lexical($!lexical), :global-fallback);
         }
         else {
             $context.ensure-sc($value);
@@ -358,7 +372,6 @@ class RakuAST::Type::Capture
 
 class RakuAST::Type::Parameterized
   is RakuAST::Type::Derived
-  is RakuAST::Declaration
 {
     has RakuAST::ArgList $.args;
 
@@ -380,7 +393,7 @@ class RakuAST::Type::Parameterized
         if !$!args.args {
             self.base-type.compile-time-value
         }
-        elsif $!args.IMPL-HAS-ONLY-COMPILE-TIME-VALUES {
+        elsif $!args.IMPL-HAS-ONLY-COMPILE-TIME-VALUES(:allow-generic) {
             my $args := $!args.IMPL-COMPILE-TIME-VALUES;
             my @pos := $args[0];
             my %named := $args[1];
@@ -420,7 +433,9 @@ class RakuAST::Type::Parameterized
 
     method IMPL-EXPR-QAST(RakuAST::IMPL::QASTContext $context) {
         if !$!args.args {
-            QAST::WVal.new( :value(self.base-type.compile-time-value) )
+            my $value := self.base-type.compile-time-value;
+            $context.ensure-sc($value);
+            QAST::WVal.new( :$value )
         }
         elsif $!args.IMPL-HAS-ONLY-COMPILE-TIME-VALUES {
             my $value := self.meta-object;
@@ -429,6 +444,7 @@ class RakuAST::Type::Parameterized
         }
         else {
             my $ptype := self.base-type.compile-time-value;
+            $context.ensure-sc($ptype);
             my $ptref := QAST::WVal.new( :value($ptype) );
             my $qast := QAST::Op.new(:op<callmethod>, :name<parameterize>, QAST::Op.new(:op<how>, $ptref), $ptref);
             $!args.IMPL-ADD-QAST-ARGS($context, $qast);
@@ -514,6 +530,7 @@ class RakuAST::Type::Enum
 
     method is-lexical() { True }
     method is-simple-lexical-declaration() { False }
+    method is-stub() { False }
 
     method IMPL-EXPR-QAST(RakuAST::IMPL::QASTContext $context) {
         my $qast := QAST::Op.new(:op('call'), :name('&ENUM_VALUES'), $!term.IMPL-EXPR-QAST($context));
@@ -605,6 +622,9 @@ class RakuAST::Type::Enum
                     }
                 }
             }
+        }
+        else {
+            $base-type := Int;
         }
 
         # Make $!base-type available, then we can produce the meta-object and add and apply traits
@@ -852,6 +872,8 @@ class RakuAST::Type::Subset
 
         self.meta-object; # Finish meta-object setup so compile time type-checks will be correct
         if $block && $block.IMPL-CURRIED {
+            $block.IMPL-CHECK($resolver, $context, False);
+            $resolver.panic(Any) if $resolver.all-sorries.elems;
             # Cache QAST with expression as the BEGIN time stub wont know how to get that
             $block.IMPL-CURRIED.IMPL-QAST-BLOCK($context, :blocktype<declaration_static>, :expression($block));
         }

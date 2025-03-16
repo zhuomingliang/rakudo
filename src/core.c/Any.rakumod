@@ -483,6 +483,11 @@ Metamodel::ClassHOW.exclude_parent(Any);
 # builtin ops
 proto sub infix:<===>($?, $?, *%) is pure {*}
 multi sub infix:<===>($? --> True) { }
+multi sub infix:<===>(Mu:U \a, Mu:U \b --> Bool:D) {
+    nqp::hllbool(
+      nqp::eqaddr(nqp::decont(a),nqp::decont(b))
+    )
+}
 multi sub infix:<===>(\a, \b --> Bool:D) {
     nqp::hllbool(
       nqp::eqaddr(nqp::decont(a),nqp::decont(b))
@@ -553,9 +558,8 @@ multi sub categorize($test, +items, *%named ) {
 }
 
 proto sub item(|) is pure {*}
-multi sub item(\x)    { my $ = x }
-multi sub item(|c)    { my $ = c.list }
-multi sub item(Mu $a) { $a }
+multi sub item(Mu \x) is raw { x.item }
+multi sub item(|c)    is raw { c.list.item }
 
 sub dd(|c) {  # is implementation-detail
 

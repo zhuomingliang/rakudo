@@ -81,7 +81,7 @@ class RakuAST::CompUnit
 
         # If CompUnit's language revision is not set explicitly then guess it
         nqp::bindattr($obj, RakuAST::CompUnit, '$!language-revision',
-          $language-revision
+          $language-revision := $language-revision
             ?? Perl6::Metamodel::Configuration.language_revision_object($language-revision)
             !! nqp::isconcrete(
                  my $setting-rev := nqp::getlexrelcaller(
@@ -108,7 +108,7 @@ class RakuAST::CompUnit
             nqp::pushcompsc($sc);
             nqp::bindattr($obj, RakuAST::CompUnit, '$!sc', $sc);
             nqp::bindattr($obj, RakuAST::CompUnit, '$!context',
-              RakuAST::IMPL::QASTContext.new(:$sc, :$precompilation-mode, :$setting));
+              RakuAST::IMPL::QASTContext.new(:$sc, :$precompilation-mode, :$setting, :$language-revision));
             nqp::bindattr($obj, RakuAST::CompUnit, '$!pod',
               RakuAST::VarDeclaration::Implicit::Doc::Pod.new);
             nqp::bindattr($obj, RakuAST::CompUnit, '$!data',
@@ -278,7 +278,7 @@ class RakuAST::CompUnit
         self.add-cu-phaser($!init-phasers, $phaser);
     }
 
-    method add-check-phaser(Code $phaser) {
+    method add-check-phaser(RakuAST::StatementPrefix::Phaser::Check $phaser) {
         self.add-cu-phaser($!check-phasers, $phaser);
     }
 
@@ -332,7 +332,27 @@ class RakuAST::CompUnit
         nqp::findmethod(RakuAST::LexicalScope, 'PERFORM-CHECK')(self, $resolver, $context);
 
         while $!check-phasers {
-            nqp::pop($!check-phasers)();
+            my $check-phaser := nqp::pop($!check-phasers);
+            {
+                if nqp::istype($check-phaser, RakuAST::StatementPrefix::Phaser::Check) {
+                    $check-phaser.run($resolver, $context);
+                }
+                else {
+                    $check-phaser();
+                }
+                CATCH {
+                    my $exception := $_;
+                    my $BeginTime := self.get-implicit-lookups.AT-POS(2).resolution.compile-time-value;
+                    my $coercer := self.get-implicit-lookups.AT-POS(3).resolution.compile-time-value;
+                    $exception := $coercer($_);
+                    my $wrapped := $BeginTime.new(:$exception, :use-case('evaluating a CHECK'));
+                    if nqp::istype($check-phaser, RakuAST::StatementPrefix::Phaser::Check) && (my $origin := $check-phaser.origin) {
+                        my $origin-match := $origin.as-match;
+                        $wrapped.SET_FILE_LINE($origin-match.file, $origin-match.line);
+                    }
+                    $wrapped.throw;
+                }
+            }
         }
     }
 
@@ -342,6 +362,10 @@ class RakuAST::CompUnit
                 'CompUnit', 'RepositoryRegistry',
             )),
             RakuAST::Type::Setting.new(RakuAST::Name.from-identifier('&FATALIZE')),
+            RakuAST::Type::Setting.new(RakuAST::Name.from-identifier-parts(
+                'X', 'Comp', 'BeginTime'
+            )),
+            RakuAST::Type::Setting.new(RakuAST::Name.from-identifier('&COMP_EXCEPTION')),
         ])
     }
 
@@ -360,6 +384,7 @@ class RakuAST::CompUnit
               how  => $!global-package-how,
               name => RakuAST::Name.from-identifier('GLOBAL')
             );
+            $global.meta-object; # Ensure GLOBAL is composed right away
 
             add($global);
             add(RakuAST::VarDeclaration::Implicit::Constant.new(
@@ -373,8 +398,9 @@ class RakuAST::CompUnit
             ));
             add(RakuAST::VarDeclaration::Implicit::Special.new(:name('$/')));
             add(RakuAST::VarDeclaration::Implicit::Special.new(:name('$!')));
-            add(RakuAST::VarDeclaration::Implicit::Special.new(:name('$_')));
         }
+
+        add(RakuAST::VarDeclaration::Implicit::Special.new(:name('$_')));
 
         add(RakuAST::VarDeclaration::Implicit::Constant.new(
           name => '$?LANGUAGE-REVISION', value => $!language-revision.Int

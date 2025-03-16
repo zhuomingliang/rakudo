@@ -54,6 +54,10 @@ class RakuAST::OnlyStar
     }
 
     method IMPL-TO-QAST(RakuAST::IMPL::QASTContext $context, :$immediate) {
+        nqp::findmethod(RakuAST::Expression, 'IMPL-TO-QAST')(self, $context)
+    }
+
+    method IMPL-EXPR-QAST(RakuAST::IMPL::QASTContext $context) {
         QAST::Op.new(
             :op('dispatch'),
             QAST::SVal.new( :value('boot-resume') ),
@@ -89,6 +93,10 @@ class RakuAST::Code
         nqp::bindattr(self, RakuAST::Code, '$!resolver', $resolver.clone);
     }
 
+    method IMPL-EXTRA-BEGIN-TIME-DECLS(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
+        []
+    }
+
     method set-custom-args() {
         nqp::bindattr(self, RakuAST::Code, '$!custom-args', True);
     }
@@ -96,9 +104,10 @@ class RakuAST::Code
     method IMPL-CLOSURE-QAST(RakuAST::IMPL::QASTContext $context, Bool :$regex) {
         my $code-obj := self.meta-object;
         $context.ensure-sc($code-obj);
+        self.IMPL-QAST-BLOCK($context, :blocktype<declaration_static>);
         my $clone := QAST::Op.new(
             :op('callmethod'), :name('clone'),
-            QAST::WVal.new( :value($code-obj) )
+            QAST::WVal.new( :value($code-obj) ).annotate_self('past_block', $!qast-block).annotate_self('code_object', $code-obj)
         );
         self.IMPL-TWEAK-REGEX-CLONE($context, $clone) if $regex;
         QAST::Op.new( :op('p6capturelex'), $clone )
@@ -133,12 +142,15 @@ class RakuAST::Code
         $context.sub-id-to-code-object(){$cuid} := $code-obj;
 
         my $precomp;
+        my $compiler-thunk := {
+            my $*IMPL-COMPILE-DYNAMICALLY := 1;
+            my $block := self.IMPL-QAST-BLOCK($context, :blocktype<declaration_static>);
+            $precomp := self.IMPL-COMPILE-DYNAMICALLY($resolver, $context, $block);
+        };
         my $stub := nqp::freshcoderef(sub (*@pos, *%named) {
             my $code-obj := nqp::getcodeobj(nqp::curcode());
             unless $precomp {
-                my $*IMPL-COMPILE-DYNAMICALLY := 1;
-                my $block := self.IMPL-QAST-BLOCK($context, :blocktype<declaration_static>);
-                $precomp := self.IMPL-COMPILE-DYNAMICALLY($resolver, $context, $block);
+                $compiler-thunk();
             }
             unless nqp::isnull($code-obj) {
                 return $code-obj(|@pos, |%named);
@@ -159,6 +171,7 @@ class RakuAST::Code
             nqp::bindattr(self, RakuAST::Code, '$!resolver', RakuAST::Resolver) if $context.is-precompilation-mode;
         });
 
+        @compstuff[1] := $compiler-thunk; # Used by multi-dispatcher to force compilation
         @compstuff[2] := sub ($orig, $clone) {
             my $do := nqp::getattr($clone, Code, '$!do');
             nqp::markcodestub($do);
@@ -345,7 +358,7 @@ class RakuAST::Code
         ));
         $wrapper[0].push(QAST::Var.new(
             :name('$/'), :scope('lexical'),
-            :decl('contvar'), :value(Mu)
+            :decl('contvar'), :value(Nil)
         ));
         my $package := $!resolver.current-package;
         $context.ensure-sc($package);
@@ -353,6 +366,17 @@ class RakuAST::Code
             :name('$?PACKAGE'), :scope('lexical'),
             :decl('static'), :value($package)
         ));
+
+        for self.IMPL-EXTRA-BEGIN-TIME-DECLS($resolver, $context) {
+            if nqp::istype($_, RakuAST::CompileTimeValue) {
+                my $value := $_.compile-time-value;
+                $context.ensure-sc($value);
+                $wrapper[0].push(QAST::Var.new(
+                    :name($_.lexical-name), :scope('lexical'),
+                    :decl('static'), :$value)
+                );
+            }
+        }
 
         self.IMPL-FIXUP-DYNAMICALLY-COMPILED-BLOCK($resolver, $context, $wrapper);
 
@@ -423,6 +447,73 @@ class RakuAST::Code
         $result
     }
 
+
+    # Some things get cloned many times with an outer lexical scope that
+    # we never enter. This makes sure we capture them as needed.
+
+    # When code runs at BEGIN time, such as role bodies and BEGIN
+    # blocks, we need to ensure we get lexical outers fixed up
+    # properly when deserializing after pre-comp. To do this we
+    # make a list of closures, which each point to the outer
+    # context. These survive serialization and thus point at what
+    # has to be fixed up.
+    method IMPL-BEGIN-TIME-LEXICAL-FIXUP(RakuAST::IMPL::QASTContext $context, Mu $block, RakuAST::LexicalFixup $lexical-fixup) {
+        my $has_nested_blocks := 0;
+        my $todo := nqp::list($block);
+        while $todo {
+            my $stmts := nqp::shift($todo);
+            for @($stmts) {
+                if nqp::istype($_, QAST::Block) {
+                    $has_nested_blocks := 1;
+                    last;
+                }
+                if nqp::istype($_, QAST::Stmts) {
+                    nqp::push($todo, $_);
+                }
+            }
+        }
+        return 0 unless $has_nested_blocks;
+
+        my $resolver := $!resolver;
+        my $throwaway_block_ast := RakuAST::Block.new(:!implicit-topic);
+        $throwaway_block_ast.set-implicit-topic(0);
+        $throwaway_block_ast.to-begin-time($resolver, $context);
+        my $throwaway_block_past := $throwaway_block_ast.IMPL-QAST-BLOCK($context, :blocktype<declaration>);
+        $throwaway_block_past.name('!LEXICAL_FIXUP');
+        $throwaway_block_past.annotate('outer', $block);
+        $block[1].push($throwaway_block_past);
+        my $throwaway_block := $throwaway_block_ast.meta-object;
+        $context.ensure-sc($throwaway_block);
+
+        # Create a list and put it in the SC.
+        my $fixup_list := FixupList.new($context.sc-handle());
+        $context.ensure-sc($fixup_list);
+
+        # Set up capturing code.
+        my $c_block_ast := RakuAST::Block.new(:!implicit-topic);
+        $c_block_ast.to-begin-time($resolver, $context);
+        my $c_block := $c_block_ast.IMPL-QAST-BLOCK($context, :blocktype<declaration_static>);
+        $c_block.name('!LEXICAL_FIXUP_CSCOPE');
+        $context.ensure-sc($c_block);
+
+        # Return a QAST node that we can push the dummy closure.
+        my $fixup := QAST::Op.new(
+            :op('callmethod'), :name('add_unresolved'),
+            QAST::WVal.new( :value($fixup_list) )
+        );
+
+        $fixup.push(QAST::Op.new(
+                :op('p6capturelex'),
+                QAST::Op.new(
+                    :op('callmethod'), :name('clone'),
+                    QAST::WVal.new( :value($throwaway_block) )
+                )));
+        $block[1].push($fixup);
+
+        $lexical-fixup.set-block($c_block_ast, $fixup_list);
+        Nil
+    }
+
     method IMPL-APPEND-SIGNATURE-RETURN(RakuAST::IMPL::QASTContext $context, Mu $qast-stmts) {
         my $signature := self.signature;
         if $signature && $signature.provides-return-value {
@@ -434,6 +525,44 @@ class RakuAST::Code
     method needs-sink-call() { False }
 
     method signature() { Nil }
+}
+
+class RakuAST::LexicalFixup
+  is RakuAST::Declaration
+{
+    has RakuAST::Block $!block;
+    has FixupList $!fixup-list;
+
+    method new() {
+        my $obj := nqp::create(self);
+        nqp::bindattr($obj, RakuAST::LexicalFixup, '$!block', RakuAST::Block);
+        nqp::bindattr($obj, RakuAST::LexicalFixup, '$!fixup-list', LexicalFixup);
+        nqp::bindattr_s($obj, RakuAST::Declaration, '$!scope', 'my');
+        $obj
+    }
+
+    method set-block(RakuAST::Block $block, FixupList $fixup-list) {
+        nqp::bindattr(self, RakuAST::LexicalFixup, '$!block', $block);
+        nqp::bindattr(self, RakuAST::LexicalFixup, '$!fixup-list', $fixup-list);
+    }
+
+    method IMPL-QAST-DECL(RakuAST::IMPL::QASTContext $context) {
+        if $!block {
+            QAST::Stmts.new(
+                $!block.IMPL-QAST-DECL-CODE($context),
+                QAST::Op.new(
+                    :op('callmethod'), :name('resolve'),
+                    QAST::WVal.new( :value($!fixup-list) ),
+                    QAST::Op.new( :op('takeclosure'), $!block.IMPL-QAST-BLOCK($context, :blocktype<declaration_static>)),
+                )
+            )
+        }
+        else {
+            QAST::Stmt.new;
+        }
+    }
+
+    method lexical-name() { '' }
 }
 
 # The base of all expression thunks, which produce a code object of some kind
@@ -457,6 +586,10 @@ class RakuAST::ExpressionThunk
 
     method thunk-details() {
         ''
+    }
+
+    method declare-topic() {
+        False
     }
 
     method PERFORM-BEGIN(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
@@ -483,7 +616,7 @@ class RakuAST::ExpressionThunk
         my $signature := self.IMPL-GET-OR-PRODUCE-SIGNATURE;
         my $stmts := QAST::Stmts.new();
         for self.IMPL-UNWRAP-LIST($signature.parameters) {
-            $stmts.push($_.target.IMPL-QAST-DECL($context)) unless $_.target.lexical-name eq '$_';
+            $stmts.push($_.target.IMPL-QAST-DECL($context)) if $_.target.lexical-name ne '$_' || self.declare-topic;
         }
         $stmts.push($signature.IMPL-QAST-BINDINGS($context));
         my $block :=
@@ -500,18 +633,22 @@ class RakuAST::ExpressionThunk
                 }
             }
         }
-        # Add blocks embedded in the thunked expression children of the thunk
-        # block, so they can access the thunk argument.
+        if nqp::istype($expression, RakuAST::ImplicitDeclarations) {
+            for self.IMPL-UNWRAP-LIST($expression.get-implicit-declarations()) -> $decl {
+                if nqp::istype($decl, RakuAST::VarDeclaration::Implicit::State) && $decl.is-simple-lexical-declaration {
+                    nqp::push($stmts, $decl.IMPL-QAST-DECL($context));
+                }
+            }
+        }
         my @code-todo := [$expression];
         while @code-todo {
             my $visit := @code-todo.shift;
             $visit.visit-children: -> $node {
-                if nqp::istype($node, RakuAST::Code) {
-                    if $visit =:= $expression
-                        || !(nqp::istype($visit, RakuAST::IMPL::ImmediateBlockUser) &&
-                            $visit.IMPL-IMMEDIATELY-USES($node))
-                    {
-                        $stmts.push($node.IMPL-QAST-DECL-CODE($context));
+                if nqp::istype($node, RakuAST::ImplicitDeclarations) {
+                    for self.IMPL-UNWRAP-LIST($node.get-implicit-declarations()) -> $decl {
+                        if nqp::istype($decl, RakuAST::VarDeclaration::Implicit::State) && $decl.is-simple-lexical-declaration {
+                            nqp::push($stmts, $decl.IMPL-QAST-DECL($context));
+                        }
                     }
                 }
                 unless nqp::istype($node, RakuAST::LexicalScope) {
@@ -519,20 +656,26 @@ class RakuAST::ExpressionThunk
                 }
             }
         }
+
+        my $nested-blocks := $expression.IMPL-QAST-NESTED-BLOCK-DECLS($context);
+        $stmts.push($nested-blocks) if nqp::elems($nested-blocks.list);
+
         $block.push($stmts) if $stmts.list;
         $block.arity($signature.arity);
 
         # If there's an inner thunk the body evaluates to that.
         if $!next {
-            $!next.IMPL-THUNK-CODE-QAST($context, $block[0], $expression);
+            $!next.IMPL-THUNK-CODE-QAST($context, $block[nqp::elems($block) - 1], $expression);
             my $value := $!next.IMPL-THUNK-VALUE-QAST($context);
             $block.push($value) if $value;
         }
 
         # Otherwise, we evaluate to the expression.
         else {
-            $block.push(self.IMPL-THUNK-TWEAK-EXPRESSION($context,
-                $expression.IMPL-EXPR-QAST($context)));
+            my $qast := self.IMPL-THUNK-TWEAK-EXPRESSION($context,
+                $expression.IMPL-EXPR-QAST($context));
+            $qast := QAST::Op.new( :op('p6sink'), $qast ) if $expression.needs-sink-call && $expression.sunk;
+            $block.push($qast);
         }
 
         $block
@@ -612,7 +755,7 @@ class RakuAST::PlaceholderParameterOwner
                 '$!attached-placeholder-parameters', []);
         }
         my $name := $placeholder.lexical-name;
-        if self.IMPL-HAS-PARAMETER($name) {
+        if self.IMPL-HAS-PARAMETER($name) || nqp::istype(self, RakuAST::Methodish) && $name eq '%_' {
             # matches an explicitly declared parameter
             $placeholder.IMPL-ALREADY-DECLARED(True);
         }
@@ -625,19 +768,6 @@ class RakuAST::PlaceholderParameterOwner
                 }
             }
             nqp::push($!attached-placeholder-parameters, $placeholder);
-        }
-        Nil
-    }
-
-    method clear-placeholder-attachments() {
-        if nqp::islist($!attached-placeholder-parameters) {
-            for $!attached-placeholder-parameters {
-                # reset declared state on parameters,
-                # will be re-set when they are attached again
-                $_.IMPL-ALREADY-DECLARED(False);
-            }
-            nqp::bindattr(self, RakuAST::PlaceholderParameterOwner,
-                '$!attached-placeholder-parameters', nqp::null());
         }
         Nil
     }
@@ -1167,7 +1297,7 @@ class RakuAST::Block
             }
             elsif $!implicit-topic-mode == -1 {
                 @implicit[0] := RakuAST::VarDeclaration::Implicit::BlockTopic.new:
-                    parameter => False;
+                    parameter => False, loop => True;
             }
             elsif $!implicit-topic-mode == 2 {
                 @implicit[0] := RakuAST::VarDeclaration::Implicit::BlockTopic.new:
@@ -1264,6 +1394,18 @@ class RakuAST::Block
         }
         self.add-phasers-to-code-object($block);
         $block
+    }
+
+    method IMPL-CHECK-DOUBLE-CLOSURE(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
+        if self.find-nodes(
+            RakuAST::Expression,
+            :condition(-> $node { $node.IMPL-CURRIED }),
+            :stopper(RakuAST::LexicalScope))
+        {
+            return $resolver.build-exception: 'X::Syntax::Malformed',
+                :what('double closure; WhateverCode is already a closure without curlies, so either remove the curlies or use valid parameter syntax instead of *');
+        }
+        Nil
     }
 
     method IMPL-QAST-FORM-BLOCK(RakuAST::IMPL::QASTContext $context, str :$blocktype,
@@ -1539,6 +1681,8 @@ class RakuAST::PointyBlock
             self.add-generated-lexical-declaration($_) for $!signature.IMPL-ENSURE-IMPLICITS($resolver, $context);
             $!signature.to-begin-time($resolver, $context);
         }
+        my $placeholder-signature := self.placeholder-signature;
+        $placeholder-signature.to-begin-time($resolver, $context) if $placeholder-signature;
 
         self.IMPL-STUB-PHASERS($resolver, $context);
 
@@ -1585,6 +1729,7 @@ class RakuAST::Routine
   is RakuAST::Code
   is RakuAST::StubbyMeta
   is RakuAST::Declaration
+  is RakuAST::Declaration::Mergeable
   is RakuAST::ImplicitDeclarations
   is RakuAST::AttachTarget
   is RakuAST::PlaceholderParameterOwner
@@ -1599,7 +1744,9 @@ class RakuAST::Routine
     has RakuAST::Signature $.signature;
     has str $!multiness;
     has RakuAST::Package $!package;
+    has RakuAST::Code $!outer;
     has Bool $.need-routine-variable;
+    has Bool $!replace-stub;
 
     method multiness() {
         my $multiness := $!multiness;
@@ -1616,6 +1763,10 @@ class RakuAST::Routine
         Nil
     }
 
+    method set-replace-stub(Bool $replace-stub) {
+        nqp::bindattr(self, RakuAST::Routine, '$!replace-stub', $replace-stub ?? True !! False);
+    }
+
     method declaration-kind() { 'routine' }
 
     method attach-target-names() {
@@ -1625,6 +1776,8 @@ class RakuAST::Routine
     method PERFORM-PARSE(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         my $package := $resolver.find-attach-target('package');
         nqp::bindattr(self, RakuAST::Routine, '$!package', $package // $resolver.global-package);
+        my $block := $resolver.find-attach-target('block', :skip-first);
+        nqp::bindattr(self, RakuAST::Routine, '$!outer', $block);
         nqp::bindattr(self, RakuAST::Code, '$!resolver', $resolver.clone);
     }
 
@@ -1635,6 +1788,11 @@ class RakuAST::Routine
     method build-bind-exception(RakuAST::Resolver $resolver) {
         $resolver.build-exception: 'X::Bind::Rebind',
             :target(self.lexical-name)
+    }
+
+    method is-stub() {
+        my $statement-list := self.body.statement-list;
+        $statement-list.IMPL-IS-SINGLE-EXPRESSION && nqp::istype($statement-list.statements.AT-POS(0).expression, RakuAST::Stub)
     }
 
     method PRODUCE-IMPLICIT-LOOKUPS() {
@@ -1677,7 +1835,7 @@ class RakuAST::Routine
         if $!package {
             nqp::bindattr($routine,Routine,'$!package',$!package.compile-time-value);
             ($!package.stubbed-meta-object.WHO){self.lexical-name} := $routine
-                if self.lexical-name && self.scope eq 'our';
+                if self.lexical-name && self.scope eq 'our' && self.multiness ne 'multi';
         }
 
         # Make sure that any OperatorProperties are set on the meta-object
@@ -1686,7 +1844,7 @@ class RakuAST::Routine
         # RakuAST::Sub.  But it will do for now.
         if $!name {
             my @parts;
-            for $!name.colonpairs {
+            for $!name.IMPL-UNWRAP-LIST($!name.colonpairs) {
                 @parts.push($_.canonicalize);
             }
             my str $op := nqp::join(' ',@parts);
@@ -1736,26 +1894,30 @@ class RakuAST::Routine
                 RakuAST::Type::Setting.new(
                     RakuAST::Name.from-identifier('Any'),
                 ).to-begin-time($resolver, $context)
-            );
+            ) unless nqp::istype(self, RakuAST::RoleBody);
             $!signature.PERFORM-PARSE($resolver, $context);
             self.add-generated-lexical-declaration($_) for $!signature.IMPL-ENSURE-IMPLICITS($resolver, $context);
             $!signature.to-begin-time($resolver, $context);
         }
 
-        if self.multiness eq 'multi' {
+        if self.multiness eq 'multi' && self.name {
             my $name := '&' ~ self.name.canonicalize;
             my $proto := $resolver.resolve-lexical($name, :current-scope-only);
             if $proto {
                 $proto := $proto.compile-time-value;
             }
             else {
+                unless self.scope eq '' || self.scope eq 'my' {
+                    $resolver.build-exception('X::Declaration::Scope::Multi', scope => self.scope, declaration => 'multi').throw;
+                }
+
                 my $scope := $resolver.current-scope;
 
-                if $proto := $resolver.resolve-lexical-constant($name) {
+                if ($proto := $resolver.resolve-lexical-constant($name)) || ($proto := $resolver.resolve-lexical-constant-in-outer($name)) {
                     $proto := $proto.compile-time-value.derive_dispatcher;
-                }
-                elsif $proto := $resolver.resolve-lexical-constant-in-outer($name) {
-                    $proto := $proto.compile-time-value.derive_dispatcher;
+                    $scope.add-generated-lexical-declaration(
+                        RakuAST::VarDeclaration::Implicit::Constant.new(:$name, :value($proto))
+                    );
                 }
                 else {
                     my $proto-ast := RakuAST::Sub.new(
@@ -1775,18 +1937,17 @@ class RakuAST::Routine
                     $proto-ast.ensure-begin-performed($resolver, $context);
                     $proto := $proto-ast.meta-object;
 
+                    $resolver.declare-lexical($proto-ast) if nqp::istype($resolver, RakuAST::Resolver::Compile);
                     $scope.add-generated-lexical-declaration(
                         RakuAST::VarDeclaration::Implicit::Block.new(:block($proto-ast))
                     );
                 }
-                $scope.add-generated-lexical-declaration(
-                    RakuAST::VarDeclaration::Implicit::Constant.new(:$name, :value($proto))
-                );
             }
             $proto.add_dispatchee(self.meta-object);
         }
         elsif self.multiness eq 'proto' {
             nqp::bindattr(self.meta-object, Routine, '@!dispatchees', []);
+            $resolver.current-scope.add-generated-lexical-declaration(self);
         }
 
         self.IMPL-STUB-PHASERS($resolver, $context);
@@ -1798,10 +1959,20 @@ class RakuAST::Routine
         self.apply-traits($resolver, $context, self)
     }
 
+    method set-value(Mu $value) {
+        nqp::bindattr(self, RakuAST::StubbyMeta, '$!cached-stubbed-meta-object', $value);
+        nqp::bindattr(self, RakuAST::Meta, '$!cached-meta-object', $value);
+    }
+
     method PERFORM-CHECK(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         self.add-trait-sorries;
 
         nqp::findmethod(RakuAST::LexicalScope, 'PERFORM-CHECK')(self, $resolver, $context);
+
+        if $!multiness && !$!name {
+            self.add-sorry:
+              $resolver.build-exception: 'X::Anon::Multi', multiness => $!multiness;
+        }
     }
 
     method PRODUCE-IMPLICIT-DECLARATIONS() {
@@ -1819,7 +1990,7 @@ class RakuAST::Routine
             }
             for self.IMPL-UNWRAP-LIST($!signature.parameters) {
                 if ($_.target) {
-                    my $name := $_.target.name;
+                    my $name := $_.target.lexical-name;
                     $slash := 0            if $name eq '$/';
                     $exclamation-mark := 0 if $name eq '$!';
                     $underscore := 0       if $name eq '$_';
@@ -1854,7 +2025,7 @@ class RakuAST::Routine
                     self.IMPL-QAST-DECLS($context)
                 ), :key);
         my $signature := self.placeholder-signature || $!signature;
-        $block.push($signature.IMPL-QAST-BINDINGS($context, :needs-full-binder(self.custom-args)));
+        $block.push($signature.IMPL-QAST-BINDINGS($context, :needs-full-binder(self.custom-args), :multi(self.multiness eq 'multi')));
         $block.custom_args(1) if self.custom-args;
         $block.arity($signature.arity);
         $block.annotate('count', $signature.count);
@@ -1912,7 +2083,7 @@ class RakuAST::Routine
         }
 
         my $name := self.lexical-name;
-        if $name && (self.scope eq 'our' || self.scope eq 'unit') {
+        if $name && (self.scope eq 'our' || self.scope eq 'unit') && self.multiness ne 'multi' {
             my $stmts := self.IMPL-SET-NODE(QAST::Stmts.new(), :key);
             $stmts.push($block);
             $stmts.push(QAST::Op.new(
@@ -1931,11 +2102,31 @@ class RakuAST::Routine
         # If we're a named lexical thing, install us in the block.
         my $name := self.lexical-name;
         if $name && self.multiness ne 'multi' {
-            QAST::Op.new(
-                :op('bind'),
-                QAST::Var.new( :decl<var>, :scope<lexical>, :$name ),
-                self.IMPL-CLOSURE-QAST($context)
-            )
+            if $!replace-stub {
+                QAST::Op.new(
+                    :op('bind'),
+                    QAST::Var.new( :scope<lexical>, :$name ),
+                    self.IMPL-CLOSURE-QAST($context)
+                )
+            }
+            else {
+                if $!outer { # Ensure each block invocation gets its own closure clone of this routine
+                    QAST::Stmts.new(
+                        QAST::Var.new( :decl<static>, :scope<lexical>, :$name, :value(self.meta-object) ),
+                        QAST::Op.new(
+                            :op('bind'),
+                            QAST::Var.new( :scope<lexical>, :$name ),
+                            self.IMPL-CLOSURE-QAST($context)
+                        )
+                    )
+                }
+                else { # No need to replace the lexical with the closure clone if declared in the comp unit directly
+                    QAST::Stmts.new(
+                        QAST::Var.new( :decl<static>, :scope<lexical>, :$name, :value(self.meta-object) ),
+                        self.IMPL-CLOSURE-QAST($context),
+                    )
+                }
+            }
         }
         else {
             QAST::Op.new( :op('null') )
@@ -1962,7 +2153,7 @@ class RakuAST::Routine
     }
 
     method is-simple-lexical-declaration() {
-        self.is-lexical && self.multiness ne 'multi'
+        self.is-lexical && self.multiness ne 'multi' && self.multiness ne 'proto'
     }
 
     method generate-lookup() {
@@ -2050,11 +2241,11 @@ class RakuAST::Sub
     }
 
     method PERFORM-CHECK(Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
-        self.add-trait-sorries;
+        nqp::findmethod(RakuAST::Routine, 'PERFORM-CHECK')(self, $resolver, $context);
 
-        nqp::findmethod(RakuAST::LexicalScope, 'PERFORM-CHECK')(self, $resolver, $context);
-
-        return Nil unless self.multiness eq 'multi';
+        # Anonymous multis will already have been reported and would lead to compiler
+        # error in the next check.
+        return Nil if self.multiness ne 'multi' || !self.name;
 
         self.IMPL-CHECK-FOR-DUPLICATE-MULTI-SIGNATURES($resolver);
     }
@@ -2093,7 +2284,7 @@ class RakuAST::Sub
 
             @seen-accepts.push($_)
                 if !($has-post-constraints || $other-has-post-constraints)
-                        && ($other-signature.ACCEPTS($signature) && $signature.ACCEPTS($other-signature));
+                        && (try $other-signature.ACCEPTS($signature) && try $signature.ACCEPTS($other-signature));
 
             if @seen-accepts > 0 {
                 my %args;
@@ -2115,6 +2306,8 @@ class RakuAST::Sub
 class RakuAST::RoleBody
   is RakuAST::Sub
 {
+    has RakuAST::LexicalFixup $.fixup;
+
     method new(          str :$scope,
                          str :$multiness,
                RakuAST::Name :$name,
@@ -2133,8 +2326,13 @@ class RakuAST::RoleBody
         $obj.set-traits($traits);
         nqp::bindattr($obj, RakuAST::Sub, '$!body',
           $body // RakuAST::Blockoid.new);
+        nqp::bindattr($obj, RakuAST::RoleBody, '$!fixup', RakuAST::LexicalFixup);
         $obj.set-WHY($WHY);
         $obj
+    }
+
+    method set-fixup(RakuAST::LexicalFixup $fixup) {
+        nqp::bindattr(self, RakuAST::RoleBody, '$!fixup', $fixup);
     }
 
     method replace-signature(RakuAST::Signature $new-signature) {
@@ -2151,6 +2349,13 @@ class RakuAST::RoleBody
     method PERFORM-BEGIN(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         # Everything already done at parse time
         Nil
+    }
+
+    method IMPL-FINISH-ROLE-BODY(RakuAST::IMPL::QASTContext $context) {
+        unless self.is-stub {
+            my $body-qast := self.IMPL-QAST-BLOCK($context, :blocktype<immediate>);
+            self.IMPL-BEGIN-TIME-LEXICAL-FIXUP($context, $body-qast, $!fixup);
+        }
     }
 }
 
@@ -2188,7 +2393,7 @@ class RakuAST::Methodish
             $placeholder-signature.set-is-on-named-method(True) if self.name;
             $placeholder-signature.set-is-on-meta-method(True) if nqp::can(self, 'meta') && self.meta;
             $placeholder-signature.set-is-on-role-method(True) if $package-is-role;
-            $placeholder-signature.attach($resolver);
+            $placeholder-signature.set-invocant-type-check(self.IMPL-INVOCANT-TYPE-CHECK);
             $placeholder-signature.PERFORM-PARSE($resolver, $context);
             self.add-generated-lexical-declaration($_) for $placeholder-signature.IMPL-ENSURE-IMPLICITS($resolver, $context);
             $placeholder-signature.to-begin-time($resolver, $context);
@@ -2211,6 +2416,7 @@ class RakuAST::Methodish
             $signature.set-is-on-named-method(True) if self.name;
             $signature.set-is-on-meta-method(True) if nqp::can(self, 'meta') && self.meta;
             $signature.set-is-on-role-method(True) if $package-is-role;
+            $signature.set-invocant-type-check(self.IMPL-INVOCANT-TYPE-CHECK);
             $signature.PERFORM-PARSE($resolver, $context);
             self.add-generated-lexical-declaration($_) for $signature.IMPL-ENSURE-IMPLICITS($resolver, $context);
             $signature.to-begin-time($resolver, $context);
@@ -2238,6 +2444,7 @@ class RakuAST::Methodish
 
         if self.multiness eq 'proto' {
             nqp::bindattr(self.meta-object, Routine, '@!dispatchees', []);
+            $resolver.outer-scope.add-generated-lexical-declaration(self) if self.scope ne 'has';
         }
         self.IMPL-STUB-PHASERS($resolver, $context);
 
@@ -2246,6 +2453,10 @@ class RakuAST::Methodish
 
         # Apply any traits.
         self.apply-traits($resolver, $context, self)
+    }
+
+    method IMPL-INVOCANT-TYPE-CHECK() {
+        True
     }
 }
 
@@ -2276,6 +2487,9 @@ class RakuAST::Method
         nqp::bindattr($obj, RakuAST::Method, '$!meta', $meta ?? True !! False);
         nqp::bindattr($obj, RakuAST::Routine, '$!name', $name // RakuAST::Name);
         nqp::bindattr($obj, RakuAST::Routine, '$!signature', $signature);
+        # Doesn't look like we can find out whether we actually need &?ROUTINE
+        # in time, so better be safe than sorry.
+        nqp::bindattr($obj, RakuAST::Routine, '$!need-routine-variable', True);
         $obj.set-traits($traits);
         nqp::bindattr($obj, RakuAST::Method, '$!body',
           $body // RakuAST::Blockoid.new);
@@ -2296,12 +2510,17 @@ class RakuAST::Method
         nqp::bindattr(self, RakuAST::Method, '$!private', $private ?? True !! False);
     }
 
+    method attach-target-names() {
+        self.IMPL-WRAP-LIST(['method', 'routine', 'block'])
+    }
+
     method IMPL-META-OBJECT-TYPE() { Method }
 
     method PRODUCE-IMPLICIT-DECLARATIONS() {
         my $list := nqp::findmethod(RakuAST::Routine, 'PRODUCE-IMPLICIT-DECLARATIONS')(self);
         self.IMPL-UNWRAP-LIST($list).push:
-            RakuAST::VarDeclaration::Implicit::Self.new(),
+            RakuAST::VarDeclaration::Implicit::Self.new();
+        $list
     }
 
     method get-boundary-sink-propagator() {
@@ -2335,6 +2554,70 @@ class RakuAST::Submethod
   is RakuAST::Method
 {
     method IMPL-META-OBJECT-TYPE() { Submethod }
+}
+
+class RakuAST::Method::AttributeAccessor
+  is RakuAST::Method
+{
+    has str $!attr-name;
+    has Mu $!type;
+    has Mu $!package-type;
+    has Bool $!rw;
+
+    method new(RakuAST::Name :$name, str :$attr-name, Mu :$type, Mu :$package-type, Bool :$rw) {
+        my $obj := nqp::create(self);
+        nqp::bindattr_s($obj, RakuAST::Declaration, '$!scope', 'has');
+        nqp::bindattr_s($obj, RakuAST::Routine, '$!multiness', '');
+        nqp::bindattr($obj, RakuAST::Method, '$!private', False);
+        nqp::bindattr($obj, RakuAST::Method, '$!meta', False);
+        nqp::bindattr($obj, RakuAST::Routine, '$!need-routine-variable', False);
+        nqp::bindattr($obj, RakuAST::Method, '$!body', RakuAST::Blockoid.new);
+        nqp::bindattr($obj, RakuAST::Routine, '$!signature', RakuAST::Signature.new);
+        nqp::die('Accessor needs a name') unless $name;
+        nqp::bindattr($obj, RakuAST::Routine, '$!name', $name);
+        nqp::bindattr_s($obj, RakuAST::Method::AttributeAccessor, '$!attr-name', $attr-name);
+        nqp::bindattr($obj, RakuAST::Method::AttributeAccessor, '$!type', $type);
+        nqp::bindattr($obj, RakuAST::Method::AttributeAccessor, '$!package-type', $package-type);
+        nqp::bindattr($obj, RakuAST::Method::AttributeAccessor, '$!rw', $rw // 0);
+        $obj
+    }
+
+    method PRODUCE-META-OBJECT() {
+        my $meta := nqp::findmethod(RakuAST::Routine, 'PRODUCE-META-OBJECT')(self);
+        $meta.set_rw if $!rw;
+        $meta
+    }
+
+    method IMPL-COMPILE-BODY(RakuAST::IMPL::QASTContext $context) {
+        # Is it a native attribute? (primpspec != 0)
+        my $native := nqp::objprimspec($!type);
+        $context.ensure-sc($!package-type);
+
+        # Set up the actual statements, starting with "self"
+        # nqp::attribute(self, $package_type, $attr_name)
+        my $accessor := QAST::Var.new(
+            :scope($native && $!rw ?? 'attributeref' !! 'attribute'),
+            :name($!attr-name),
+            :returns($!type),
+            QAST::Var.new( :scope<lexical>, :name('self') ),
+            QAST::WVal.new( :value($!package-type) ),
+        );
+
+        # Opaque and read-only accessors need a decont
+        unless $native || $!rw {
+            $accessor := QAST::Op.new( :op<decont>, $accessor );
+        }
+
+        $accessor
+    }
+}
+
+class RakuAST::Method::ClassAccessor
+  is RakuAST::Method
+{
+    method IMPL-WRAP-RETURN-HANDLER(RakuAST::IMPL::QASTContext $context, QAST::Node $qast) {
+        $qast
+    }
 }
 
 # Base class for regex declaration, such as `token foo { bar }`. This
@@ -2390,6 +2673,10 @@ class RakuAST::RegexDeclaration
     }
 
     method IMPL-META-OBJECT-TYPE() { Regex }
+
+    method IMPL-INVOCANT-TYPE-CHECK() {
+        self.scope ne 'my'
+    }
 
     method PRODUCE-IMPLICIT-DECLARATIONS() {
         my @declarations := [
@@ -2448,6 +2735,7 @@ class RakuAST::RegexThunk
   is RakuAST::Meta
   is RakuAST::BeginTime
 {
+
     method PRODUCE-META-OBJECT() {
         # Create default signature, receiving invocant only.
         my $signature := nqp::create(Signature);
@@ -2466,6 +2754,7 @@ class RakuAST::RegexThunk
     method IMPL-QAST-FORM-BLOCK(RakuAST::IMPL::QASTContext $context, str :$blocktype,
             RakuAST::Expression :$expression) {
         my $slash := RakuAST::VarDeclaration::Implicit::Special.new(:name('$/'));
+        my $thunk := self.IMPL-THUNKED-REGEX-QAST($context); # must be before nested blocks
         QAST::Block.new(
             :blocktype('declaration_static'),
             QAST::Var.new( :decl('var'), :scope('local'), :name('self') ),
@@ -2490,7 +2779,7 @@ class RakuAST::RegexThunk
                     )
                 )
             ),
-            self.IMPL-THUNKED-REGEX-QAST($context)
+            $thunk
         )
     }
 
@@ -2814,6 +3103,14 @@ class RakuAST::Substitution
         $!replacement.wrap-with-thunk: RakuAST::SubstitutionReplacementThunk.new:
             :infix($!infix);
         $!replacement.visit-thunks(-> $thunk { $thunk.ensure-begin-performed($resolver, $context) });
+
+        self.IMPL-QAST-BLOCK($context, :blocktype<declaration_static>);
+    }
+
+    method IMPL-ADVERBS-TO-COMPILATION-MODS() {
+        my %mods := nqp::findmethod(RakuAST::QuotedMatchConstruct, 'IMPL-ADVERBS-TO-COMPILATION-MODS')(self);
+        %mods<s> := 1 if $!samespace;
+        %mods
     }
 
     method IMPL-THUNKED-REGEX-QAST(RakuAST::IMPL::QASTContext $context) {
@@ -2823,9 +3120,7 @@ class RakuAST::Substitution
 
     method IMPL-QAST-DECL-CODE(RakuAST::IMPL::QASTContext $context) {
         # Form the block itself and link it with the meta-object.
-        my $block := self.IMPL-QAST-FORM-BLOCK($context, :blocktype('declaration_static'));
-        self.IMPL-LINK-META-OBJECT($context, $block);
-        $block
+        self.IMPL-QAST-BLOCK($context, :blocktype('declaration_static'));
     }
 
     method IMPL-EXPR-QAST(RakuAST::IMPL::QASTContext $context) {
@@ -2835,7 +3130,7 @@ class RakuAST::Substitution
         my $lookups    := self.get-implicit-lookups;
         my $topic      := $lookups.AT-POS(0);
         my $slash      := $lookups.AT-POS(1);
-        my $Positional := $lookups.AT-POS(2);
+        my $Positional := $lookups.AT-POS(2).compile-time-value;
 
         my $topic-str-var := QAST::Node.unique('subst_topic_str');
         my $result := self.IMPL-SET-NODE(
@@ -2860,6 +3155,11 @@ class RakuAST::Substitution
         my int $sigspace := $samespace;
         my int $samecase;
         my int $samemark;
+        if $!samespace {
+            my $arg := QAST::IVal.new(:value(1));
+            $arg.named('samespace');
+            $match-qast.push($arg);
+        }
         for self.IMPL-UNWRAP-LIST(self.adverbs) {
             my str $norm := self.IMPL-NORMALIZE-ADVERB($_.key);
             if self.IMPL-IS-POSITION-ADVERB($norm) {
@@ -2868,7 +3168,7 @@ class RakuAST::Substitution
                     :named($norm), :op<if>,
                     $match-lookup,
                     QAST::Op.new( :op<callmethod>, :name<to>, $match-lookup ),
-                    QAST::IVal.new( :value(0) )
+                    QAST::IVal.new( :value(0) ) unless $norm eq 'ss' && $!samespace;
             }
             else {
                 # Pass the value of the pair.
@@ -2893,6 +3193,7 @@ class RakuAST::Substitution
             }
         }
         my $match-result-var := QAST::Node.unique('subst_match');
+        my $list-result      := QAST::Node.unique('subst_list_result');
         $result.push: QAST::Op.new:
             :op('bind'),
             QAST::Var.new( :decl('var'), :scope('local'), :name($match-result-var) ),
@@ -2958,6 +3259,44 @@ class RakuAST::Substitution
                 # For the s/// form, evaluate to the match variable
                 !! $match-lookup;
 
+        $result.push:
+            # If we have a list of matches, then put them into $/,
+            # otherwise, $/ already has the Match object we want it to have
+            QAST::Op.new( :op('if'),
+                QAST::Op.new( :op('istype'),
+                    QAST::Var.new( :name($match-result-var), :scope('local') ),
+                    QAST::WVal.new( :value($Positional) )
+                ),
+                QAST::Op.new( :op('p6store'),
+                    QAST::Var.new( :name('$/'), :scope('lexical') ),
+                    QAST::Stmts.new(
+                        QAST::Op.new( :op('bind'),
+                            QAST::Var.new( :name($list-result), :scope('local'), :decl('var') ),
+                            QAST::Op.new( :op('create'),
+                                QAST::WVal.new( :value(List) )
+                            )
+                        ),
+                        QAST::Op.new( :op('bindattr'),
+                            QAST::Var.new( :name($list-result), :scope('local') ),
+                            QAST::WVal.new( :value(List) ),
+                            QAST::SVal.new( :value('$!reified') ),
+                            QAST::Op.new( :op('getattr'),
+                                QAST::Var.new( :name($match-result-var), :scope('local') ),
+                                QAST::WVal.new( :value(List) ),
+                                QAST::SVal.new( :value('$!reified') )
+                            )
+                        ),
+                        QAST::Var.new( :name($list-result), :scope('local') )
+                    )
+                ),
+            );
+        if $!immutable {
+            $result.resultchild(nqp::elems($result.list) - 2);
+        }
+        else {
+            $result.push: QAST::Var.new( :name('$/'), :scope('lexical') );
+        }
+
         $result
     }
 
@@ -2966,6 +3305,80 @@ class RakuAST::Substitution
         $visitor($!pattern);
         $visitor($!infix) if $!infix;
         $visitor($!replacement);
+    }
+}
+
+class RakuAST::Transliteration
+  is RakuAST::ImplicitLookups
+  is RakuAST::QuotedMatchConstruct
+{
+    has Bool $.destructive;
+    has RakuAST::Expression $.left;
+    has RakuAST::Expression $.right;
+
+    method new(Bool :$destructive!, RakuAST::Expression :$left!, RakuAST::Expression :$right!, List :$adverbs) {
+        my $obj := nqp::create(self);
+        nqp::bindattr($obj, RakuAST::Transliteration, '$!destructive', $destructive ?? True !! False);
+        nqp::bindattr($obj, RakuAST::Transliteration, '$!left', $left);
+        nqp::bindattr($obj, RakuAST::Transliteration, '$!right', $right);
+        $obj.replace-adverbs($adverbs // List);
+        $obj
+    }
+
+    method PRODUCE-IMPLICIT-LOOKUPS() {
+        self.IMPL-WRAP-LIST([
+            RakuAST::Type::Setting.new(RakuAST::Name.from-identifier('Pair')),
+            RakuAST::Type::Setting.new(RakuAST::Name.from-identifier('StrDistance')),
+        ])
+    }
+
+    method IMPL-EXPR-QAST(RakuAST::IMPL::QASTContext $context) {
+        my $Pair := self.get-implicit-lookups.AT-POS(0).resolution.compile-time-value;
+        my $trans := QAST::Op.new:
+            QAST::Var.new(:name<$_>, :scope<lexical>),
+            :op<callmethod>, :name<trans>,
+                QAST::Op.new:
+                    :op<callmethod>, :name<new>, :returns($Pair),
+                    QAST::WVal.new( :value($Pair) ),
+                    $!left.IMPL-TO-QAST($context),  # key
+                    $!right.IMPL-TO-QAST($context); # value
+        for self.IMPL-UNWRAP-LIST(self.adverbs) {
+            my $arg := $_.value.IMPL-TO-QAST($context);
+            $arg.named($_.key);
+            $trans.push($arg);
+        }
+        if $!destructive {
+            my $StrDistance := self.get-implicit-lookups.AT-POS(1).resolution.compile-time-value;
+            my $original := QAST::Node.unique: 'original_value_to_trans';
+
+            QAST::Stmt.new(
+                QAST::Op.new( # save original $_ into our temp var
+                    QAST::Var.new(:name($original), :scope<lexical>, :decl<var>),
+                    :op<bind>, QAST::Op.new: :op<decont>,
+                    QAST::Var.new(:name<$_>, :scope<lexical>)
+                ),
+                QAST::Op.new( # call .trans() and assign result to $_
+                    QAST::Var.new(:name<$_>, :scope<lexical>),
+                    :op<call>, :name('&infix:<=>'),
+                    $trans,
+                ),
+                QAST::Op.new: # our return value: the StrDistance object
+                    :returns($StrDistance),
+                    QAST::Var.new(
+                      :name<StrDistance>, :scope<lexical> ),
+                    :op<callmethod>, :name<new>,
+                        QAST::Var.new(
+                          :named<before>, :name($original), :scope<lexical>),
+                        QAST::Var.new:
+                          :named<after>,  :name<$_>, :scope<lexical>).annotate_self('regex_match_code', 1)
+        }
+        else {
+            $trans
+        }
+    }
+
+    method PERFORM-BEGIN(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
+        Nil
     }
 }
 
@@ -3106,5 +3519,62 @@ class RakuAST::BlockThunk
         nqp::bindattr($sig, Signature, '$!code', $code);
         self.IMPL-THUNK-META-OBJECT-PRODUCED($code);
         $code
+    }
+}
+
+class FixupList {
+    has Mu $!list;
+    has Mu $!resolved;
+    has Mu $!resolver;
+
+    method new(Str $sc-handle) {
+        my $obj := nqp::create(FixupList);
+        nqp::bindattr($obj, FixupList, '$!list', nqp::list());
+        nqp::bindattr($obj, FixupList, '$!resolved', Mu);
+        nqp::bindattr($obj, FixupList, '$!resolver', $sc-handle);
+        $obj
+    }
+
+    method add_unresolved($code) {
+        nqp::scwbdisable();
+        nqp::push($!list, $code);
+        nqp::scwbenable();
+        if nqp::isconcrete($!resolved) {
+            my $CU := $*CU;
+            if nqp::can($CU, 'context') && nqp::can($CU.context, "sc-handle") && $CU.context.sc-handle ne $!resolver {
+                $CU.context.ensure-sc($code);
+                $CU.context.add-deserialize-task(-> { QAST::Op.new(
+                    :op('callmethod'), :name('update'),
+                    QAST::WVal.new( :value(self) ),
+                    QAST::WVal.new( :value($code) )
+                ) });
+            }
+            else {
+                my $do := nqp::getattr($code, Code, '$!do');
+                nqp::p6captureouters2([$do], $!resolved);
+            }
+        }
+    }
+    method resolve($resolved) {
+        nqp::scwbdisable();
+        nqp::bindattr(self, FixupList, '$!resolved', $resolved);
+        nqp::scwbenable();
+        my $do-list := nqp::list();
+        my int $i := 0;
+        my int $n := nqp::elems($!list);
+        while $i < $n {
+            nqp::bindpos($do-list, $i, nqp::getattr(nqp::atpos($!list, $i), Code, '$!do'));
+            $i++;
+        }
+        nqp::p6captureouters2($do-list, $resolved);
+    }
+    method update($code) {
+        if !nqp::isnull($!resolved) && !nqp::istype($!resolved, Mu) {
+            my $do := nqp::getattr($code, Code, '$!do');
+            nqp::p6captureouters2([$do],
+                nqp::getcomp('Raku').backend.name eq 'moar'
+                    ?? nqp::getstaticcode($!resolved)
+                    !! $!resolved);
+        }
     }
 }

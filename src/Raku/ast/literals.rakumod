@@ -17,9 +17,16 @@ class RakuAST::Literal
         $obj
     }
 
+    # Attempt to convert given value to a RakuAST::xxxLiteral object,
+    # or return Mu if failed
     method from-value(Mu $value) {
-        my $typename := $value.HOW.name($value);
-        my $obj := nqp::create(RakuAST.WHO{$typename ~ 'Literal'});
+        my $typename  := $value.HOW.name($value);
+        my $classname := $typename ~ 'Literal';
+        my $obj := nqp::create(nqp::isconcrete($value)
+          && nqp::existskey(RakuAST.WHO,$classname)
+          ?? RakuAST.WHO{$classname}
+          !! RakuAST::Literal
+        );
         nqp::bindattr($obj, RakuAST::Literal, '$!value',    $value);
         nqp::bindattr($obj, RakuAST::Literal, '$!typename', $typename);
         $obj
@@ -63,7 +70,7 @@ class RakuAST::Literal
         $type
     }
 
-    # default for non int/str/num literals
+    # default for non int/str/num/bool literals
     method IMPL-EXPR-QAST(RakuAST::IMPL::QASTContext $context) {
         my $value := $!value;
         $context.ensure-sc($value);
@@ -123,14 +130,6 @@ class RakuAST::ComplexLiteral
 { }
 
 class RakuAST::VersionLiteral
-  is RakuAST::Literal
-{ }
-
-class RakuAST::ListLiteral
-  is RakuAST::Literal
-{ }
-
-class RakuAST::MapLiteral
   is RakuAST::Literal
 { }
 
@@ -199,7 +198,7 @@ class RakuAST::QuotedString
     }
 
     method canonicalize() {
-        self.IMPL-QUOTE-VALUE(self.literal-value // '')
+        self.IMPL-QUOTE-VALUE(self.literal-value(:force) // '')
     }
 
     method PRODUCE-IMPLICIT-LOOKUPS() {
@@ -318,7 +317,7 @@ class RakuAST::QuotedString
 
     # Tries to get a literal value for the quoted string. If that is not
     # possible, returns Nil.
-    method literal-value() {
+    method literal-value(:$force) {
         my @parts;
         for $!segments {
             if nqp::istype($_, RakuAST::StrLiteral) {
@@ -341,9 +340,12 @@ class RakuAST::QuotedString
             }
             elsif nqp::istype($_, RakuAST::Var::Lexical)
                 && $_.is-resolved
-                && nqp::istype($_.resolution, RakuAST::VarDeclaration::Constant)
+                && ($force || nqp::istype($_.resolution, RakuAST::VarDeclaration::Constant))
             {
                 self.IMPL-PROCESS-PART(@parts, $_.resolution.compile-time-value.Str) || return Nil;
+            }
+            elsif $force && nqp::istype($_, RakuAST::Block) && $_.body.IMPL-CAN-INTERPRET {
+                nqp::push(@parts, ~$_.body.IMPL-INTERPRET(RakuAST::IMPL::InterpContext.new));
             }
             else {
                 return Nil;
@@ -443,7 +445,7 @@ class RakuAST::QuotedString
                     $inter-qast := QAST::Op.new( :op('call'), $inter-qast );
                 }
                 @segment-asts.push(QAST::Op.new(
-                    :op('callmethod'), :name('Str'),
+                    :op('callmethod'), :name('Stringy'),
                     $inter-qast
                 ));
             }
@@ -567,6 +569,14 @@ class RakuAST::QuotedString
 
     method IMPL-IS-CONSTANT() {
         nqp::isconcrete(self.literal-value) ?? True !! False
+    }
+
+    method has-compile-time-value() {
+        nqp::isconcrete(self.literal-value) ?? True !! False
+    }
+
+    method maybe-compile-time-value() {
+        self.literal-value
     }
 
     method IMPL-CAN-INTERPRET() {

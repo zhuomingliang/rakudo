@@ -18,12 +18,27 @@ my class Hash { # declared in BOOTSTRAP
     multi method Map(Hash:D:) {
         nqp::create(Map).STORE(self, :INITIALIZE, :DECONT)
     }
-    method clone(Hash:D:) is raw {
+
+    multi method clone(Hash:D:) {
+        my $iter := nqp::iterator(
+          my $storage := nqp::clone(nqp::getattr(self,Map,'$!storage'))
+        );
+
+        # Only re-containerize the values that are containers
+        nqp::while(
+          $iter,
+          nqp::if(
+            nqp::iscont(my $value := nqp::iterval(nqp::shift($iter))),
+            nqp::bindkey(
+              $storage,nqp::iterkey_s($iter),nqp::clone_nd($value)
+            )
+          )
+        );
+
         nqp::p6bindattrinvres(
-          nqp::p6bindattrinvres(
-            nqp::create(self),Map,'$!storage',
-            nqp::clone(nqp::getattr(self,Map,'$!storage'))),
-          Hash, '$!descriptor', nqp::clone($!descriptor))
+          nqp::p6bindattrinvres(nqp::clone(self),Map,'$!storage',$storage),
+          Hash, '$!descriptor', nqp::clone($!descriptor)
+        )
     }
 
     method !AT_KEY_CONTAINER(str $key) is raw {
@@ -497,10 +512,7 @@ proto sub circumfix:<{ }>(|) {*}
 multi sub circumfix:<{ }>() is default { my % }
 multi sub circumfix:<{ }>(*@elems) { my % = @elems }
 
-# XXX parse dies with 'don't change grammar in the setting, please!'
-# with ordinary sub declaration
-#sub circumfix:<:{ }>(*@elems) { Hash.^parameterize(Mu,Any).new(@elems) }
-BEGIN my &circumfix:<:{ }> = sub (*@e) { Hash.^parameterize(Mu,Any).new(@e) }
+sub circumfix:<:{ }>(*@elems) { Hash.^parameterize(Mu,Any).new(@elems) }
 
 proto sub hash(|) {*}
 #?if !jvm

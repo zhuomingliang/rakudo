@@ -255,6 +255,14 @@ class RakuAST::StatementList
         self.IMPL-WRAP-LIST($!statements)
     }
 
+    method IMPL-NON-EMPTY-CODE-STATEMENTS() {
+        my @stmts;
+        for self.code-statements {
+            nqp::push(@stmts, $_) unless nqp::istype($_, RakuAST::Statement::Empty);
+        }
+        @stmts
+    }
+
     # Return whether there are any whenevers
     method any-whenevers() {
         for $!statements {
@@ -300,7 +308,7 @@ class RakuAST::StatementList
                 $catch-seen++;
             }
             if nqp::istype($_, RakuAST::Statement::Control) {
-                if $catch-seen {
+                if $control-seen {
                     self.add-sorry:
                       $resolver.build-exception: 'X::Phaser::Multiple', block => 'CONTROL';
                 }
@@ -319,7 +327,7 @@ class RakuAST::StatementList
 
     method IMPL-TO-QAST(RakuAST::IMPL::QASTContext $context, :$immediate) {
         my $stmts := self.IMPL-SET-NODE(QAST::Stmts.new, :key);
-        my @statements := self.code-statements;
+        my @statements := self.IMPL-NON-EMPTY-CODE-STATEMENTS;
         my $Nil := self.get-implicit-lookups.AT-POS(1);
         for @statements {
             my $qast := $_.IMPL-TO-QAST($context);
@@ -376,7 +384,7 @@ class RakuAST::StatementList
     method propagate-sink(Bool $is-sunk, Bool :$has-block-parent) {
         # Sink all statements, with the possible exception of the last one (only if
         # we are not sunk).
-        my @statements := self.code-statements;
+        my @statements := self.IMPL-NON-EMPTY-CODE-STATEMENTS;
         my int $i;
         my int $n := nqp::elems(@statements);
         my int $wanted-statement := $is-sunk ?? -1 !! $n - 1;
@@ -447,6 +455,14 @@ class RakuAST::SemiList
         }
         nqp::bindattr_i(self, RakuAST::StatementList, '$!is-sunk', $is-sunk ?? 1 !! 0);
         Nil
+    }
+
+    # Tries to get a literal value for a quoted string. If that is not
+    # possible, returns Nil.
+    method literal-value() {
+        if self.IMPL-IS-SINGLE-EXPRESSION && self.IMPL-CAN-INTERPRET {
+            return self.IMPL-INTERPRET(RakuAST::IMPL::InterpContext.new);
+        }
     }
 
     method PRODUCE-IMPLICIT-LOOKUPS() {
@@ -570,10 +586,14 @@ class RakuAST::Statement::Expression
   is RakuAST::Sinkable
   is RakuAST::BlockStatementSensitive
   is RakuAST::BeginTime
+  is RakuAST::CheckTime
 {
     has RakuAST::Expression $.expression;
     has RakuAST::StatementModifier::Condition $.condition-modifier;
     has RakuAST::StatementModifier::Loop $.loop-modifier;
+    has RakuAST::ExpressionThunk $.loop-thunk;
+    has RakuAST::ExpressionThunk $.condition-thunk;
+    has RakuAST::ExpressionThunk $.expression-thunk;
 
     method new(RakuAST::Expression :$expression!, List :$labels,
                RakuAST::StatementModifier::Condition :$condition-modifier,
@@ -634,6 +654,30 @@ class RakuAST::Statement::Expression
         $qast
     }
 
+    # StatementModifier::WhileUntil needs us to thunk loop-condition, condition-modifier and expression
+    # but crucially it only needs this if we're not a block statement and we're not sunk. The problem is
+    # that at BEGIN time we don't know that yet. But BEGIN time is the latest that we can thunk those
+    # expressions. We may not even get a CHECK time if this statement is executed at BEGIN time. Thus
+    # we thunk just in case and if it turns out we're sunk, we have to undo that thunking again.
+    method IMPL-UNTHUNK() {
+        if $!loop-modifier && nqp::istype($!loop-modifier, RakuAST::StatementModifier::WhileUntil) && nqp::defined($!loop-thunk) {
+            $!loop-modifier.expression.IMPL-REMOVE-THUNK($!loop-thunk)
+                unless $!loop-modifier.IMPL-UNNEGATE-IF-NEEDED;
+            nqp::bindattr(self, RakuAST::Statement::Expression, '$!loop-thunk', RakuAST::ExpressionThunk);
+            if $!condition-modifier {
+                nqp::die('cond thunk not defined?') unless nqp::defined($!condition-thunk);
+                $!expression.IMPL-REMOVE-THUNK($!condition-thunk);
+                nqp::bindattr(self, RakuAST::Statement::Expression, '$!condition-thunk', RakuAST::ExpressionThunk);
+            }
+
+            if !nqp::istype($!expression, RakuAST::Block) {
+                nqp::die('expr thunk not defined') unless nqp::defined($!expression-thunk);
+                $!expression.IMPL-REMOVE-THUNK($!expression-thunk);
+                nqp::bindattr(self, RakuAST::Statement::Expression, '$!expression-thunk', RakuAST::ExpressionThunk);
+            }
+        }
+    }
+
     method IMPL-DISCARD-RESULT() {
         (
             self.is-block-statement
@@ -644,12 +688,14 @@ class RakuAST::Statement::Expression
     }
 
     method propagate-sink(Bool $is-sunk) {
+        self.IMPL-UNTHUNK() if $is-sunk;
         $!expression.apply-sink($is-sunk);
         $!condition-modifier.apply-sink(False) if $!condition-modifier;
         $!loop-modifier.apply-sink(False) if $!loop-modifier;
     }
 
     method mark-block-statement() {
+        self.IMPL-UNTHUNK();
         nqp::findmethod(RakuAST::BlockStatementSensitive, 'mark-block-statement')(self);
         if nqp::istype($!expression, RakuAST::BlockStatementSensitive) {
             $!expression.mark-block-statement();
@@ -659,7 +705,7 @@ class RakuAST::Statement::Expression
     method PERFORM-BEGIN(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         if $!loop-modifier {
             my $thunk := $!loop-modifier.expression-thunk;
-            if $thunk && !nqp::istype($!expression, RakuAST::Code) {
+            if $thunk && !nqp::istype($!expression, RakuAST::Block) {
                 # only need to thunk the condition if we also have a loop thunk
                 if $!condition-modifier {
                     my $thunk := $!condition-modifier.expression-thunk;
@@ -669,7 +715,32 @@ class RakuAST::Statement::Expression
                 $!expression.wrap-with-thunk($thunk);
                 $thunk.ensure-begin-performed($resolver, $context);
             }
+
+            # See IMPL-UNTHUNK for important information
+            if (nqp::istype($!loop-modifier, RakuAST::StatementModifier::WhileUntil)) {
+                $!loop-modifier.IMPL-NEGATE-IF-NEEDED($resolver, $context);
+                my $loop-thunk := RakuAST::ExpressionThunk.new;
+                $!loop-modifier.expression.wrap-with-thunk($loop-thunk);
+                $loop-thunk.ensure-begin-performed($resolver, $context);
+                nqp::bindattr(self, RakuAST::Statement::Expression, '$!loop-thunk', $loop-thunk);
+
+                if !nqp::istype($!expression, RakuAST::Block) {
+                    if $!condition-modifier {
+                        my $thunk := $!condition-modifier.expression-thunk;
+                        $!expression.wrap-with-thunk($thunk);
+                        $thunk.ensure-begin-performed($resolver, $context);
+                        nqp::bindattr(self, RakuAST::Statement::Expression, '$!condition-thunk', $thunk);
+                    }
+                    my $thunk := RakuAST::ExpressionThunk.new;
+                    $!expression.wrap-with-thunk($thunk);
+                    $thunk.ensure-begin-performed($resolver, $context);
+                    nqp::bindattr(self, RakuAST::Statement::Expression, '$!expression-thunk', $thunk);
+                }
+            }
         }
+    }
+
+    method PERFORM-CHECK(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
     }
 
     method visit-children(Code $visitor) {
@@ -991,6 +1062,7 @@ class RakuAST::Statement::Without
 # and subclassed with assorted defaults for while/until/repeat.
 class RakuAST::Statement::Loop
   is RakuAST::Statement
+  is RakuAST::CheckTime
   is RakuAST::ImplicitLookups
   is RakuAST::Sinkable
   is RakuAST::SinkPropagator
@@ -1043,10 +1115,41 @@ class RakuAST::Statement::Loop
         self.is-block-statement || self.sunk
     }
 
+    method PERFORM-CHECK(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
+        my @undo-phasers := $!body.IMPL-UNWRAP-LIST($!body.meta-object.phasers('UNDO'));
+        if !self.IMPL-DISCARD-RESULT || nqp::elems(@undo-phasers) {
+            my $while := !self.negate;
+            unless (!$!increment && $!condition && $!condition.has-compile-time-value && $!condition.maybe-compile-time-value == $while) {
+                if ($!condition) {
+                    if self.negate {
+                        nqp::bindattr(self, RakuAST::Statement::Loop, '$!condition', RakuAST::ApplyPostfix.new(
+                            :postfix(
+                                RakuAST::Call::Method.new(:name(RakuAST::Name.from-identifier('not')))
+                            ),
+                            :operand($!condition),
+                        ));
+                        $!condition.ensure-begin-performed($resolver, $context);
+                    }
+                    my $thunk := RakuAST::ExpressionThunk.new;
+                    $!condition.wrap-with-thunk($thunk);
+                    $thunk.ensure-begin-performed($resolver, $context);
+                }
+
+                if ($!increment) {
+                    my $thunk := RakuAST::ExpressionThunk.new;
+                    $!increment.wrap-with-thunk($thunk);
+                    $thunk.ensure-begin-performed($resolver, $context);
+                }
+            }
+        }
+    }
+
     method IMPL-TO-QAST(RakuAST::IMPL::QASTContext $context) {
         my @next-phasers := $!body.IMPL-UNWRAP-LIST($!body.meta-object.phasers('NEXT'));
         my @last-phasers := $!body.IMPL-UNWRAP-LIST($!body.meta-object.phasers('LAST'));
-        if self.IMPL-DISCARD-RESULT {
+        my @undo-phasers := $!body.IMPL-UNWRAP-LIST($!body.meta-object.phasers('UNDO'));
+        my @labels := self.IMPL-UNWRAP-LIST(self.labels);
+        if self.IMPL-DISCARD-RESULT && !nqp::elems(@undo-phasers) {
             # Select correct node type for the loop and produce it.
             my str $op := self.repeat
                 ?? (self.negate ?? 'repeat_until' !! 'repeat_while')
@@ -1071,7 +1174,6 @@ class RakuAST::Statement::Loop
             }
 
             # Add a label if there is one.
-            my @labels := self.IMPL-UNWRAP-LIST(self.labels);
             if @labels {
                 my $label-qast := @labels[0].IMPL-LOOKUP-QAST($context);
                 $label-qast.named('label');
@@ -1097,7 +1199,56 @@ class RakuAST::Statement::Loop
             $wrapper
         }
         elsif ($!condition || $!increment) {
-            nqp::die("Non-trivial lazy loops NYI");
+            my $Seq := self.get-implicit-lookups.AT-POS(1).IMPL-TO-QAST($context);
+            my $while := !self.negate;
+            if (!$!increment && $!condition.has-compile-time-value && $!condition.maybe-compile-time-value == $while) {
+                my $qast := QAST::Stmts.new;
+                my $loop-qast := QAST::Op.new(:op('callmethod'), :name('from-loop'),
+                    $Seq,
+                    $!body.IMPL-TO-QAST($context),
+                );
+                if @labels {
+                    my $label-qast := @labels[0].IMPL-LOOKUP-QAST($context);
+                    $label-qast.named('label');
+                    $loop-qast.push($label-qast);
+                }
+                $qast.push: $loop-qast;
+                $qast
+            }
+            else {
+                my $Seq := self.get-implicit-lookups.AT-POS(1).IMPL-TO-QAST($context);
+                my $qast := QAST::Op.new(:op<callmethod>, :name('from-loop'),
+                    $Seq,
+                    $!body.IMPL-TO-QAST($context),
+                    $!condition.IMPL-TO-QAST($context),
+                );
+                $qast.push: $!increment.IMPL-TO-QAST($context) if $!increment;
+                if @labels {
+                    my $label-qast := @labels[0].IMPL-LOOKUP-QAST($context);
+                    $label-qast.named('label');
+                    $qast.push($label-qast);
+                }
+                #TODO next-phasers
+                if @last-phasers {
+                    $qast := QAST::Stmts.new(:resultchild(0), $qast);
+                    for @last-phasers {
+                        $context.ensure-sc($_);
+                        $qast.push(QAST::Op.new(:op('call'), QAST::WVal.new(:value($_))));
+                    }
+                }
+                if self.IMPL-DISCARD-RESULT { # In case we're here because of UNDO phasers
+                    $qast := QAST::Op.new(:op('p6sink'), $qast);
+                }
+                if $!setup {
+                    QAST::Stmt.new(
+                        $!setup.IMPL-TO-QAST($context),
+                        $qast
+                    );
+                }
+                else {
+                    $qast
+                }
+            }
         }
         else {
             my $Seq := self.get-implicit-lookups.AT-POS(1).IMPL-TO-QAST($context);
@@ -1111,6 +1262,11 @@ class RakuAST::Statement::Loop
                 $!body.IMPL-TO-QAST($context),
                 QAST::WVal.new(:value($cond)),
             );
+            if @labels {
+                my $label-qast := @labels[0].IMPL-LOOKUP-QAST($context);
+                $label-qast.named('label');
+                $qast.push($label-qast);
+            }
             if @next-phasers {
                 my $run-phasers := -> { $_() for @next-phasers };
                 $context.ensure-sc($run-phasers);
@@ -1143,7 +1299,8 @@ class RakuAST::Statement::Loop
     }
 
     method IMPL-IMMEDIATELY-USES(RakuAST::Node $node) {
-        self.sunk && $node =:= $!body
+        my @undo-phasers := $!body.IMPL-UNWRAP-LIST($!body.meta-object.phasers('UNDO'));
+        self.sunk && !nqp::elems(@undo-phasers) && $node =:= $!body
     }
 }
 
@@ -1584,7 +1741,7 @@ class RakuAST::ModuleLoading {
           'CompUnit', 'DependencySpecification'
         );
         my $opts := nqp::hash();
-        for $module-name.colonpairs {
+        for $module-name.IMPL-UNWRAP-LIST($module-name.colonpairs) {
             $opts{$_.key} := $_.simple-compile-time-quote-value;
         }
         my $spec := $dependency-specification.new(
@@ -1605,7 +1762,7 @@ class RakuAST::ModuleLoading {
         $comp-unit
     }
 
-    method IMPL-IMPORT(RakuAST::Resolver $resolver, Mu $handle, Mu $arglist) {
+    method IMPL-IMPORT(RakuAST::Resolver $resolver, Mu $handle, Mu $arglist, Str :$module) {
         my $EXPORT := $handle.export-package;
         if nqp::isconcrete($EXPORT) {
             $EXPORT := $EXPORT.FLATTENABLE_HASH();
@@ -1618,8 +1775,7 @@ class RakuAST::ModuleLoading {
                     if nqp::istype($tag, $Pair) {
                         my str $tag-name := nqp::unbox_s($tag.key);
                         unless nqp::existskey($EXPORT, $tag-name) {
-                            # TODO X::Import::NoSuchTag
-                            nqp::die('No such tag')
+                            $resolver.build-exception('X::Import::NoSuchTag', source-package => $module, :tag($tag-name)).throw;
                         }
                         nqp::push(@to-import, $tag-name);
                     }
@@ -1715,7 +1871,7 @@ class RakuAST::Statement::Use
             !! Nil;
 
         my $comp-unit := self.IMPL-LOAD-MODULE($resolver, $!module-name);
-        self.IMPL-IMPORT($resolver, $comp-unit.handle, $arglist);
+        self.IMPL-IMPORT($resolver, $comp-unit.handle, $arglist, :module($!module-name.canonicalize));
     }
 
     method visit-children(Code $visitor) {
@@ -1804,7 +1960,7 @@ class RakuAST::Statement::Import
         my $module := self.resolution.compile-time-value;
         my $CompUnitHandle := self.get-implicit-lookups().AT-POS(0).compile-time-value;
         my $handle := $CompUnitHandle.from-unit($module.WHO);
-        self.IMPL-IMPORT($resolver, $handle, $arglist);
+        self.IMPL-IMPORT($resolver, $handle, $arglist, :module($!module-name.canonicalize));
     }
 
     method visit-children(Code $visitor) {
@@ -1817,18 +1973,21 @@ class RakuAST::Statement::Import
 # A require statement.
 class RakuAST::Statement::Require
   is RakuAST::Statement
+  is RakuAST::Sinkable
   is RakuAST::BeginTime
   is RakuAST::ImplicitLookups
 {
     has RakuAST::Name $.module-name;
+    has RakuAST::Expression $.file;
     has RakuAST::Expression $.argument;
     has List $!arglist;
     has RakuAST::Package $!module;
     has RakuAST::Node $!existing-lookup;
 
-    method new(RakuAST::Name :$module-name!, RakuAST::Expression :$argument) {
+    method new(RakuAST::Name :$module-name!, RakuAST::Expression :$file, RakuAST::Expression :$argument) {
         my $obj := nqp::create(self);
-        nqp::bindattr($obj, RakuAST::Statement::Require, '$!module-name', $module-name);
+        nqp::bindattr($obj, RakuAST::Statement::Require, '$!module-name', $module-name // RakuAST::Name);
+        nqp::bindattr($obj, RakuAST::Statement::Require, '$!file', $file // RakuAST::Expression);
         nqp::bindattr($obj, RakuAST::Statement::Require, '$!argument',
             $argument // RakuAST::Expression);
         $obj
@@ -1873,37 +2032,82 @@ class RakuAST::Statement::Require
                 self,
                 RakuAST::Statement::Require,
                 '$!module',
-                RakuAST::Package.new(:scope<my>, :name($!module-name), :is-require-stub),
+                RakuAST::Package.new(:scope<my>, :name($!module-name.without-colonpair('file')), :is-require-stub),
             );
             $!module.to-begin-time($resolver, $context);
-            $resolver.leave-scope;
+            if nqp::istype($resolver, RakuAST::Resolver::Compile) {
+                $resolver.leave-scope;
+            }
             $!module.set-is-stub(True);
         }
 
         Nil
     }
 
+    method IMPL-SHORT-NAME(RakuAST::IMPL::QASTContext $context) {
+        if $!module-name.is-indirect-lookup {
+            if $!module-name.is-multi-part {
+                my $qast := QAST::Op.new(:op<call>, :name('&infix:<,>'));
+                for $!module-name.IMPL-UNWRAP-LIST($!module-name.parts) {
+                    $qast.push: $_.IMPL-QAST-INDIRECT-LOOKUP-PART($context, Mu, 0)
+                }
+                QAST::Op.new(:op<callmethod>, :name<join>,
+                    $qast,
+                    QAST::SVal.new(:value<::>)
+                )
+            }
+            else {
+                $!module-name.parts.AT-POS(0).expr.IMPL-TO-QAST($context)
+            }
+        }
+        else {
+            QAST::SVal.new(:value($!module-name.canonicalize))
+        }
+    }
+
     method IMPL-TO-QAST(RakuAST::IMPL::QASTContext $context) {
         my $lookups := self.get-implicit-lookups;
         my $depspec  := $lookups.AT-POS(0).compile-time-value;
         my $registry := $lookups.AT-POS(1).compile-time-value;
-        my $short-name := QAST::SVal.new(:value($!module-name.canonicalize));
-        $short-name.named('short-name');
 
-        my $spec := QAST::Op.new(
-            :op('callmethod'), :name('new'),
-            QAST::WVal.new(:value($depspec)),
-            $short-name,
-        );
-        my $compunit_qast := QAST::Op.new(
-            :op('callmethod'), :name('need'),
-            QAST::Op.new(
-                :op('callmethod'), :name('head'),
-                QAST::WVal.new(:value($registry)),
-            ),
-            $spec,
-        );
-        my $require-qast := QAST::Op.new(:op<call>, :name<&REQUIRE_IMPORT>, $compunit_qast);
+        my $compunit-qast;
+        my $file;
+        if $!module-name && (my $file-cp := $!module-name.first-colonpair('file')) {
+            $file := $file-cp.IMPL-VALUE-QAST($context);
+        }
+        if $!module-name && !nqp::defined($file) {
+            my $short-name := self.IMPL-SHORT-NAME($context);
+            $short-name.named('short-name');
+            my $spec := QAST::Op.new(
+                :op('callmethod'), :name('new'),
+                QAST::WVal.new(:value($depspec)),
+                $short-name,
+            );
+            $compunit-qast := QAST::Op.new(
+                :op('callmethod'), :name('need'),
+                QAST::Op.new(
+                    :op('callmethod'), :name('head'),
+                    QAST::WVal.new(:value($registry)),
+                ),
+                $spec,
+            );
+        }
+        else {
+            my $file-qast := ($file // $!file.IMPL-TO-QAST($context));
+            $compunit-qast := QAST::Op.new(
+                :op('callmethod'), :name('load'),
+                QAST::Op.new(
+                    :op('callmethod'), :name('head'),
+                    QAST::WVal.new(:value($registry)),
+                ),
+                QAST::Op.new(
+                    :op('callmethod'), :name('IO'),
+                    $file-qast,
+                ),
+            );
+        }
+
+        my $require-qast := QAST::Op.new(:op<call>, :name<&REQUIRE_IMPORT>, $compunit-qast);
         # A list of the components of the pre-existing outer symbols name (if any)
         my $existing-path := QAST::Var.new( :name('Any'), :scope('lexical') );
         # The top level package object of the  pre-existing outer package (if any)
@@ -1942,17 +2146,21 @@ class RakuAST::Statement::Require
         $require-qast.push($existing-path);
         $require-qast.push($top-existing);
         $require-qast.push($lexical-stub // QAST::Var.new( :name('Any'), :scope('lexical') ));
-        my $scalar := $!module.compile-time-value;
-        $context.ensure-sc($scalar);
-        $require-qast.push(QAST::WVal.new(:value($scalar)));
-        my $name-parts := QAST::Op.new(:op<call>, :name('&infix:<,>'));
-        if $!module-name {
+        if $!module-name && $!module {
+            my $scalar := $!module.compile-time-value;
+            $context.ensure-sc($scalar);
+            $require-qast.push(QAST::WVal.new(:value($scalar)));
+            my $name-parts := QAST::Op.new(:op<call>, :name('&infix:<,>'));
             for self.IMPL-UNWRAP-LIST($!module-name.parts) {
                 $name-parts.push: QAST::SVal.new(:value($_.name));
             }
+            $context.ensure-sc($name-parts);
+            $require-qast.push($name-parts);
         }
-        $context.ensure-sc($name-parts);
-        $require-qast.push($name-parts);
+        else {
+            $require-qast.push(QAST::WVal.new(:value(Any)));
+            $require-qast.push(QAST::WVal.new(:value(Any)));
+        }
         if $!argument {
             for $!arglist {
                 $require-qast.push(QAST::SVal.new(:value($_.Str)));
@@ -1961,10 +2169,18 @@ class RakuAST::Statement::Require
 
         my $qast := QAST::Stmts.new;
         $qast.push($require-qast);
+        unless self.sunk {
+            $qast.push: $!module-name
+                ?? $!module-name.IMPL-QAST-INDIRECT-LOOKUP($context)
+                !! $!file.IMPL-TO-QAST($context);
+        }
         $qast
     }
 
     method visit-children(Code $visitor) {
-        $visitor($!module-name);
+        $visitor($!module-name) if $!module-name;
+        $visitor($!file) if $!file;
+        $visitor($!argument) if $!argument;
+        $visitor($!module) if $!module;
     }
 }

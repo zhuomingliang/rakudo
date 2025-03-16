@@ -657,7 +657,7 @@ role Raku::Common {
                     if $expected_term {
                         %opts<reason> := "Bogus term";
                     }
-                    elsif $*IN_META {
+                    elsif $*IN-META {
                         %opts<reason> := "Bogus infix";
                     }
                     elsif $cursor.MARKED('baresigil') {
@@ -785,7 +785,10 @@ role Raku::Common {
 
     # Return the name of the meta op if any
     method meta-op-name($desigilname) {
-        my $op := $desigilname.colonpairs[0].literal-value;
+        my $colonpair := $desigilname.IMPL-UNWRAP-LIST($desigilname.colonpairs)[0];
+        my $op := nqp::istype($colonpair, self.actions.r('QuotedString'))
+            ?? $colonpair.literal-value
+            !! $colonpair.semilist.code-statements[0].expression.literal-value;
         if $op ne '!=' && $op ne '≠' {
             my $lang := self.'!cursor_init'($op, :p(0));
             $lang.clone_braid_from(self);
@@ -801,8 +804,8 @@ role Raku::Common {
                   ?? 'postfixish'
                   !! $category;
 
-            my $cursor := $lang."$method"();
-            if $cursor.pos == nqp::chars($op) {
+            my $cursor := try $lang."$method"(); # Catch any panics thrown by parser
+            if $cursor && $cursor.pos == nqp::chars($op) {
                 my $match := $cursor.MATCH;
                 if   $match<infix-prefix-meta-operator>
                   || $match<infix-circumfix-meta-operator>
@@ -1311,7 +1314,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
 
         <!!{ $/.set_actions($actions); 1 }>
         <!before <.[\])}]> | $ >
-        #<!stopper>
+        <!stopper>
         <!!{ nqp::rebless($/, self.slang_grammar('MAIN')); 1 }>
 
         [
@@ -1371,7 +1374,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
     }
 
     # Helper token to match the start of a pointy block
-    token pointy-block-starter { '->' | '→' | '<->' | '↔' }
+    token pointy-block-starter { '->' | '<->' }
 
     # Parsing a (pointy) block
     token pointy-block {
@@ -1686,6 +1689,11 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
         ]
     }
 
+    # Not really control statements, more grammar tweaks
+    rule statement-control:sym<trusts> {
+        <sym><.kok> [ <typename> || <.typo-typename(1)> ]
+    }
+
 #-------------------------------------------------------------------------------
 # Pragma and module loading related statements
 
@@ -1974,6 +1982,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
             nqp::deletekey($termish, 'prefixish');
             nqp::deletekey($termish, 'postfixish');
             nqp::push(@termstack, nqp::atkey($termish, 'term'));
+            my $*TERMISH := $termish;
 
             last if $noinfix;
 
@@ -2417,6 +2426,11 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
         ]
     }
 
+    # These are here to prevent us generating the candidates when parsing CORE.setting.
+    token postcircumfix:sym<[; ]> { <!> }
+    token postcircumfix:sym<{; }> { <!> }
+    token circumfix:sym<:{ }> { <!> }
+
 #-------------------------------------------------------------------------------
 
     proto token dotty {*}
@@ -2513,7 +2527,9 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
     token sub-integer   { <[₀₁₂₃₄₅₆₇₈₉]>+ }
 
     token power {
-        <super-sign>? <super-integer>
+        <.super-sign>? <.super-integer> [
+          ⁱ? | <.super-sign> <.super-integer> ⁱ
+        ]
     }
     token vulgar {
           <[ ½ ↉ ⅓ ⅔ ¼ ¾ ⅕ ⅖ ⅗ ⅘ ⅙ ⅚ ⅐ ⅛ ⅜ ⅝ ⅞ ⅑ ⅒ ]>
@@ -2534,7 +2550,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
 
     # TODO: report the correct bracket in error message
     token postfix:sym«->» {
-        $<sym>=[ '->' | '→' ]
+        <sym>
         [
           | ['[' | '{' | '(' ]
             <.obs: '->(), ->{} or ->[] as postfix dereferencer',
@@ -2573,6 +2589,10 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
         <sym>
         <?before \d+ <?before \. <.?alpha> >
         <.worry: "Precedence of ^ is looser than method call; please parenthesize"> >?
+    }
+    token prefix:sym<//>  {
+        <?{ self.language-revision >= 3 }>
+        <sym>
     }
 
 #-------------------------------------------------------------------------------
@@ -2779,6 +2799,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
     token infix:sym«=~=»    { <sym> }
     token infix:sym«≅»      { <sym> }
     token infix:sym«==»     { <sym> }
+    token infix:sym«⩵»      { <sym> }
     token infix:sym«≠»      { <sym> }
     token infix:sym«<=»     { <sym> }
     token infix:sym«≤»      { <sym> }
@@ -2788,11 +2809,14 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
     token infix:sym«>»      { <sym> }
     token infix:sym«=:=»    { <sym> }
     token infix:sym<===>    { <sym> }
+    token infix:sym<⩶>      { <sym> }
     token infix:sym<~~>     { <sym> }
     token infix:sym<!~~>    { <sym> }
     token infix:sym«∈»      { <sym> }
+    token infix:sym«∊»      { <sym> }
     token infix:sym«∉»      { <sym> }
     token infix:sym«∋»      { <sym> }
+    token infix:sym«∍»      { <sym> }
     token infix:sym«∌»      { <sym> }
     token infix:sym«(<)»    { <sym> }
     token infix:sym«⊂»      { <sym> }
@@ -2800,6 +2824,9 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
     token infix:sym«(>)»    { <sym> }
     token infix:sym«⊃»      { <sym> }
     token infix:sym«⊅»      { <sym> }
+    token infix:sym«(==)»   { <sym> }
+    token infix:sym«≡»      { <sym> }
+    token infix:sym«≢»      { <sym> }
     token infix:sym«(<=)»   { <sym> }
     token infix:sym«⊆»      { <sym> }
     token infix:sym«⊈»      { <sym> }
@@ -3165,6 +3192,37 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
           'the =finish pod marker and $=finish to read'>
     }
 
+    token infix:sym<lambda> {
+        <?before '{' | <.pointy-block-starter> > <!{ $*IN-META }> {
+            my $needparens := 0;
+            my $pos := $/.from;
+            my $line := HLL::Compiler.lineof($/.orig, $/.from, :cache(1));
+            if $*TERMISH {
+                my $term := $*TERMISH.ast;
+                if nqp::istype($term, self.actions.r('Call', 'Name')) {
+                    $term.to-begin-time($*R, $*CU.context);
+                    $term.PERFORM-CHECK($*R, $*CU.context);
+                    if nqp::istype($term, self.actions.r('Lookup')) && !$term.is-resolved && $term.needs-resolution {
+                        my $word := $term.name.canonicalize;
+                        for 'if', 'unless', 'while', 'until', 'for', 'given', 'when', 'loop', 'sub', 'method', 'with', 'without', 'supply', 'whenever', 'react' {
+                            if $_ eq $word {
+                                $needparens++ if $_ eq 'loop';
+                                self.typed-sorry-at($*TERMISH<term><identifier>.to, 'X::Syntax::KeywordAsFunction', :$word, :$needparens);
+                                self.panic("Unexpected block in infix position (two terms in a row)");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        [
+        || <!{ $*IN_REDUCE }> {
+            $/.panic("Unexpected block in infix position (missing statement control word before the expression?)");
+        }
+        || <!>
+        ]
+    }
+
     token term:sym<identifier> {
         <identifier>
         <!{ $*R.is-identifier-type(~$<identifier>) }>
@@ -3246,12 +3304,17 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
              <args(1)>
              {
                 my $desigilname := $<longname>.ast;
-                if nqp::elems($desigilname.colonpairs) == 1
-                    && nqp::istype($desigilname.colonpairs[0], self.actions.r('QuotedString'))
-                {
-                    my $meta-op-name := self.meta-op-name($desigilname);
-                    if nqp::isconcrete($meta-op-name) {
-                        $*META-OP := $meta-op-name;
+                if nqp::elems($desigilname.IMPL-UNWRAP-LIST($desigilname.colonpairs)) == 1 {
+                    my $colonpair := $desigilname.IMPL-UNWRAP-LIST($desigilname.colonpairs)[0];
+                    if nqp::istype($colonpair, self.actions.r('QuotedString'))
+                        || nqp::istype($colonpair, self.actions.r('Circumfix', 'ArrayComposer'))
+                            && $colonpair.semilist.IMPL-IS-SINGLE-EXPRESSION
+                            && nqp::istype($colonpair.semilist.code-statements[0].expression, self.actions.r('QuotedString'))
+                    {
+                        my $meta-op-name := self.meta-op-name($desigilname);
+                        if nqp::isconcrete($meta-op-name) {
+                            $*META-OP := $meta-op-name;
+                        }
                     }
                 }
                 my $name := ~$<longname>;
@@ -3693,6 +3756,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
         <.stub-package($<longname>)>
         { $/.set_package($*PACKAGE) }
         :my $*ALSO-TARGET := $*PACKAGE;
+        :my $*TRUSTS-TARGET := $*PACKAGE;
         <trait($*PACKAGE)>*
         <.enter-package-scope($<signature>)>
         [
@@ -3874,6 +3938,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
             $*LEFTSIGIL := self.leading-char unless $*LEFTSIGIL;
             $sigil := $<sigil> ?? $<sigil>.Str !! "";
             $*VARIABLE-NAME := $<sigil> ~ $<twigil> ~ $<desigilname>;
+            $/.add-variable($*VARIABLE-NAME);
         }
         [
           <.unspace>?
@@ -3998,8 +4063,8 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
                 my $opname := '';
                 if $cf<circumfix> -> $ccf {
                     $opname := (my $nibble := $ccf<nibble>)
-                      ?? $nibble.ast.literal-value // ~$nibble
-                      !! $ccf<semilist>;
+                      ?? $nibble.ast.literal-value(:force) // ~$nibble
+                      !! $ccf<semilist>.ast.literal-value // ~$ccf<semilist>;
                 }
                 my $canname := $category
                   ~ ':sym'
@@ -4032,13 +4097,14 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
                        what  => "sub",
                        where => "on a $*MULTINESS sub";
                  }
-                 unless $*R.outer-scope =:= $*UNIT {
+                 unless $*R.outer-scope.WHAT =:= self.actions.r('CompUnit') {
                      $/.typed-panic: "X::UnitScope::Invalid",
                        what  => "sub",
                        where => "in a subscope";
                  }
                  $*START-OF-COMPUNIT := 0;
              }
+             <statementlist>     # whole rest of file, presumably
 
           || <onlystar>
 
@@ -4057,11 +4123,15 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
             if nqp::istype($*BLOCK, self.actions.r('ParseTime')) {
                 $*BLOCK.to-parse-time($*R, $*CU.context);
             }
-            $*R.create-scope-implicits();
+        }
+        {
+            # Declare self early for attribute parameters
+            $*R.declare-lexical($/.actions.r('VarDeclaration', 'Implicit', 'Self').new)
         }
         [ '(' <signature(1, :ON-ROUTINE(1))> ')' ]?
         <trait($*BLOCK)>* :!s
         { if $<signature> { $*BLOCK.replace-signature($<signature>.ast); } }
+        { $*R.create-scope-implicits(); }
         { $*IN-DECL := ''; }
         [
           || <onlystar>
@@ -4139,7 +4209,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
         if $categorical && nqp::can(self, $cat) {
             my $canop := self.actions.r('ColonPairish').IMPL-QUOTE-VALUE($categorical[0][1]);
             my $canname := $cat ~ ':sym' ~ $canop;
-            self.add-categorical($cat, ~$categorical[0][1], $canname, ~$categorical[0]);
+            self.add-categorical($cat, ~$categorical[0][1], $canname, ~$categorical[0], :current-scope);
         }
     }
 
@@ -4602,6 +4672,43 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
         [ <?{ $<sibble><infixish> }> || <.old-rx-modifiers>? ]
     }
 
+    # nibbler for tr///
+    token tribble ($l, $lang2, $base, @lang2tweaks?) {
+        :my $lang;
+        :my $start;
+        :my $stop;
+        :my $*CCSTATE := '';
+        <babble($l, $base, @lang2tweaks)>
+        { my $B := $<babble><B>.ast; $lang := $B[0]; $start := $B[1]; $stop := $B[2]; }
+
+        $start <left=.nibble($lang)> [ $stop || { self.fail-terminator($/, $start, $stop) } ]
+        { $*CCSTATE := ''; }
+        [ <?{ $start ne $stop }>
+            $start <right=.nibble($lang)> [ $stop || { self.fail-terminator($/, $start, $stop) } ]
+        ||
+            { $lang := self.quote-lang($lang2, $stop, $stop, $base, @lang2tweaks); }
+            <right=.nibble($lang)> $stop || <.panic("Malformed replacement part; couldn't find final $stop")>
+        ]
+    }
+
+    token quote:sym<tr> {
+        $<sym>=['tr' | 'TR']
+        :my %*RX;
+        :my $*INTERPOLATE := 1;
+        {} <.qok($/)>
+        # <rx-adverbs('tr-adverb')>
+        <rx-adverbs>
+        <tribble(self.slang_grammar('Quote'), self.slang_grammar('Quote'), 'qq', [['cc', 1]])>
+        <.old-rx-modifiers>?
+    }
+
+    token quote:sym<y> {
+        <sym>
+        <?before \h*\W>
+        {} <.qok($/)>
+        <.obs('y///','tr///')>
+    }
+
     token sibble($l, $lang2, $base?) {
         <babble($l)>
 
@@ -4691,14 +4798,14 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
           | $<neg>='!'
             [ <identifier> || <.malformed: "False pair; expected identifier"> ]
             [
-              <[ \[ \( \< \{ ]>
+              <[ \[ \( \< ]>
               { $/.typed-panic('X::Syntax::NegatedPair',key => ~$<identifier>) }
             ]?
             { $*KEY := $<identifier> }
 
           | $<num>=[\d+]
             <identifier>
-            [ <?before <.[ \[ \( \< \{ ]>>
+            [ <?before <.[ \[ \( \< ]>>
               {}
               <.sorry("Extra argument not allowed; pair already has argument of " ~ $<num>.Str)>
               <.circumfix>
@@ -4764,14 +4871,20 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
 #-------------------------------------------------------------------------------
 # Signatures
 
+    token sigterm {
+        :dba('signature')
+        ':(' ~ ')' <fakesignature>
+    }
+
     token fakesignature {
         :my $*BLOCK;
+        :my $*MULTINESS := '';
         <.enter-block-scope('PointyBlock')>
         <signature(1, :DECLARE-TARGETS(0))>
         <.leave-block-scope>
     }
 
-    token signature($*ALLOW_INVOCANT = 0, :$*DECLARE-TARGETS = 1, :$*ON-VARDECLARATION, :$*ON-ROUTINE) {
+    token signature($*ALLOW_INVOCANT = 0, :$*DECLARE-TARGETS = 1, :$*ON-VARDECLARATION, :$*ON-ROUTINE, :$*ARRAY = 0) {
         :my $*MULTI-INVOCANT := 1;
         :my @*SEPS := nqp::list();
         <.ws>
@@ -4892,16 +5005,16 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
     token param-var {
         :dba('formal parameter')
         [
-          | '[' ~ ']' <signature(:DECLARE-TARGETS($*DECLARE-TARGETS))>
+          | '[' ~ ']' <signature(:DECLARE-TARGETS($*DECLARE-TARGETS), :ON-ROUTINE($*ON-ROUTINE), :ARRAY)>
 
-          | '(' ~ ')' <signature(:DECLARE-TARGETS($*DECLARE-TARGETS))>
+          | '(' ~ ')' <signature(:DECLARE-TARGETS($*DECLARE-TARGETS), :ON-ROUTINE($*ON-ROUTINE))>
 
           | $<declname>=[
               <sigil>
               <twigil>?
               [
-#               || <?{ $<sigil>.Str eq '&' }>
-#                  [<?identifier> {} <name=.sublongname> | <sigterm>]
+                || <?{ $<sigil>.Str eq '&' }>
+                   [<?identifier> {} <name=.sublongname> | <sigterm>]
 
                 || <name=.identifier>
 
@@ -4921,7 +5034,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
                | <?before '('>
                  <.sorry: "Shape declaration with () is reserved;\n  please use whitespace if you meant a subsignature for unpacking,\n  or use the :() form if you meant to add signature info to the function's type">
 
-#               | <?before '['> <arrayshape=.postcircumfix>
+               | <?before '['> <arrayshape=.postcircumfix>
 
                | <?before <.[ { < « ]>>
                  <.sorry: 'Shape declaration is not yet implemented; please use whitespace if you meant something else'>
@@ -5083,6 +5196,14 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
         <colonpair>*
     }
 
+    token subshortname {
+        <desigilname>
+    }
+
+    token sublongname {
+        <subshortname> <sigterm>?
+    }
+
     token defterm {
         :dba('new term to be defined')
 
@@ -5101,7 +5222,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
                     my $canop := self.actions.r('ColonPairish').IMPL-QUOTE-VALUE(~$opname);
                     my $canname := $category ~ ':sym' ~ $canop;
                     my $termname := $category ~ ':' ~ $canop;
-                    $/.add-categorical($category, $opname, $canname, $termname, :defterm);
+                    $/.add-categorical($category, $opname, $canname, $termname, :defterm, :current-scope);
                 }
             }
         | <?>
@@ -5189,7 +5310,7 @@ grammar Raku::Grammar is HLL::Grammar does Raku::Common {
     # example new infix operators add to the infix category. Augments the
     # grammar as needed.
     method add-categorical(
-      $category, $opname, $canname, $subname, $declarand?, :$defterm
+      $category, $opname, $canname, $subname, $declarand?, :$defterm, :$current-scope
     ) {
         my $actions            := self.actions;
         my $OperatorProperties := $actions.OperatorProperties;
@@ -5373,10 +5494,11 @@ Rakudo significantly on *every* run."
         if $category eq 'postcircumfix' {
             my role PostcircumfixAction[$meth, $subname] {
                 method ::($meth)($/) {
-                    make QAST::Op.new(
-                        :op('call'), :name('&' ~ $subname), :node($/),
-                        $<statement>.ast
+                    my $ast := self.r('Call','Name').new(
+                        :name(self.r('Name').from-identifier($subname)),
+                        :args(self.r('ArgList').new($<statement>.ast))
                     );
+                    self.attach: $/, $ast;
                 }
             };
             $actions-mixin := PostcircumfixAction.HOW.curry(
@@ -5386,14 +5508,15 @@ Rakudo significantly on *every* run."
         elsif $category eq 'circumfix' {
             my role CircumfixAction[$meth, $subname] {
                 method ::($meth)($/) {
-                    make QAST::Op.new(
-                        :op('call'), :name('&' ~ $subname), :node($/),
-                        $<semilist>.ast
+                    my $ast := self.r('Call','Name').new(
+                        :name(self.r('Name').from-identifier($subname)),
+                        :args(self.r('ArgList').new(|$<semilist>.ast.FLATTENABLE_LIST))
                     );
+                    self.attach: $/, $ast;
                 }
             };
             $actions-mixin := CircumfixAction.HOW.curry(
-              CircumfixAction, $canname, $subname
+                CircumfixAction, $canname, $subname
             );
         }
         elsif $category eq 'term' {
@@ -5409,7 +5532,7 @@ Rakudo significantly on *every* run."
             };
             $actions-mixin := $defterm
               ?? TermAction.HOW.curry(TermActionConstant, $canname, $subname)
-              !! TermAction.HOW.curry(TermAction, $canname, $subname);
+              !! TermAction.HOW.curry(TermAction, $canname, $opname);
         }
 
         # Set up next statement to have new actions.
@@ -5426,7 +5549,7 @@ Rakudo significantly on *every* run."
         my $descriptor := $descriptor_type.new( :dynamic(1), :name("LANG") );
         nqp::bindattr($scalar, $*R.type-from-setting('Scalar'), '$!descriptor', $descriptor);
 
-        $*R.outer-scope.merge-generated-lexical-declaration(
+        ($current-scope ?? $*R.current-scope !! $*R.outer-scope).merge-generated-lexical-declaration(
             :resolver($*R),
             :force,
             self.actions.r('VarDeclaration', 'Implicit', 'Constant').new(
@@ -6069,6 +6192,10 @@ grammar Raku::QGrammar is HLL::Grammar does Raku::Common {
         self.truly($v, ':regex');
         self.Regex
     }
+    method tweak_cc($v) {
+        self.truly($v, ':cc');
+        self.apply_tweak(Raku::QGrammar::cc);
+    }
     method tweak_to($v) {
         self.truly($v, ':to');
         # the cursor_init is to ensure it's been initialized the same way
@@ -6162,6 +6289,71 @@ grammar Raku::QGrammar is HLL::Grammar does Raku::Common {
             @*NIBBLES := @NIBBLES;
         }
     }
+
+    role cc {
+        token starter { \' }
+        token stopper { \' }
+
+        method ccstate ($s) {
+            if $*CCSTATE eq '..' {
+                $*CCSTATE := '';
+            }
+            else {
+                $*CCSTATE := $s;
+            }
+            self;
+        }
+
+        # (must not allow anything to match . in nibbler or we'll lose track of state)
+        token escape:ws { \s+ [ <?[#]> <.ws> ]? }
+        token escape:sym<#> { '#' <.panic: "Please backslash # for literal char or put whitespace in front for comment"> }
+        token escape:sym<\\> { <sym> <item=.backslash> <.ccstate('\\' ~ $<item>)> }
+        token escape:sym<..> { <sym>
+            [
+            || <?{ ($*CCSTATE eq '') || ($*CCSTATE eq '..') }> <.sorry("Range missing start character on the left")>
+            || <?before \s* <!stopper> <!before '..'> \S >
+            || <.sorry("Range missing stop character on the right")>
+            ]
+            { $*CCSTATE := '..'; }
+        }
+
+        token escape:sym<-> {
+            '-' <?{ $*CCSTATE ne '' }> \s* <!stopper> \S
+            <.obs('- as character range','.. (or \\- if you mean a literal hyphen)')>
+        }
+        token escape:ch { $<ch> = [\S] { self.ccstate($<ch>) } }
+
+        token backslash:delim { <text=.starter> | <text=.stopper> }
+        token backslash:sym<\\> { <text=.sym> }
+        token backslash:sym<a> { :i <sym> }
+        token backslash:sym<b> { :i <sym> }
+        token backslash:sym<c> { :i <sym> <charspec> }
+        token backslash:sym<d> { :i <sym> { $*CCSTATE := '' } }
+        token backslash:sym<e> { :i <sym> }
+        token backslash:sym<f> { :i <sym> }
+        token backslash:sym<h> { :i <sym> { $*CCSTATE := '' } }
+        token backslash:sym<N> { <?before 'N{'<.[A..Z]>> <.obs('\N{CHARNAME}','\c[CHARNAME]')>  }
+        token backslash:sym<n> { :i <sym> }
+        token backslash:sym<o> { :i :dba('octal character') <sym> [ <octint> | '[' ~ ']' <octints> | '{' <.obsbrace> ] }
+        token backslash:sym<r> { :i <sym> }
+        token backslash:sym<s> { :i <sym> { $*CCSTATE := '' } }
+        token backslash:sym<t> { :i <sym> }
+        token backslash:sym<v> { :i <sym> { $*CCSTATE := '' } }
+        token backslash:sym<w> { :i <sym> { $*CCSTATE := '' } }
+        token backslash:sym<x> { :i :dba('hex character') <sym> [ <hexint> | '[' ~ ']' <hexints> | '{' <.obsbrace> ] }
+        token backslash:sym<0> { <sym> }
+
+        # keep random backslashes like qq does
+        token backslash:misc { {}
+            [
+            | $<text>=(\W)
+            | $<x>=(\w) <.typed_panic: 'X::Backslash::UnrecognizedSequence', :sequence(~$<x>)>
+            ]
+        }
+        multi method tweak_q($v) { self.panic("Too late for :q") }
+        multi method tweak_qq($v) { self.panic("Too late for :qq") }
+        multi method tweak_cc($v) { self.panic("Too late for :cc") }
+    }
 }
 
 #-------------------------------------------------------------------------------
@@ -6228,7 +6420,8 @@ grammar Raku::RegexGrammar is QRegex::P6Regex::Grammar does Raku::Common {
         <var=.LANG('MAIN', 'variable')>
         { self.check-variable($<var>) }
         [
-            <?before '.'? <.[ \[ \{ \< ]>>
+        || $<binding> = ( \s* '=' \s* <quantified_atom> )
+        || <?before '.'? <.[ \[ \{ \< ]>>
             <.worry: "Apparent subscript will be treated as regex">
         ]?
         <.SIGOK>
@@ -6255,13 +6448,25 @@ grammar Raku::RegexGrammar is QRegex::P6Regex::Grammar does Raku::Common {
 
     token metachar:sym<mod> {
         ':'
-        $<negated>  = '!'?
-        $<modifier> = \w+
+        [
+        || <?before '!'> $<n>=('!')**1  $<modifier> = \w+ »
+        || <?before \d>  $<n>=(\d+)**1  $<modifier> = \w+ »
+        || $<modifier> = \w+
+            [
+            '('
+                [
+                | $<n>=[\d+]
+                | <?[']> <quote_EXPR: ':q'>
+                | <?["]> <quote_EXPR: ':qq'>
+                ]
+                ')'
+            ]**0..1
+        ]
 
         :my $*NEGATED;
         :my $*MODIFIER;
         {
-            $*NEGATED  := ?~$<negated>;
+            $*NEGATED := $<n>[0] gt '' ?? ($<n>[0] eq '!' ?? 1 !! !+$<n>[0]) !! 0;
             $*MODIFIER := self.slangs<MAIN>.adverb-rx2str(~$<modifier>);
         }
     }

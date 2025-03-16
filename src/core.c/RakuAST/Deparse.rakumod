@@ -67,7 +67,7 @@ class RakuAST::Deparse {
     method block-open( --> "\{\n") { }
     method block-close(--> "\}\n") { }
 
-    method regex-open(                  --> '/ ')  { }
+    method regex-open(                  --> '/')  { }
     method regex-close(                 --> '/')   { }
     method regex-alternation(           --> '| ')  { }
     method regex-sequential-alternation(--> '|| ') { }
@@ -763,6 +763,10 @@ CODE
           ~ $.parens-close
     }
 
+    multi method deparse(RakuAST::ColonPairs:D $ast, Str $xsyn = "" --> Str:D) {
+        self.colonpairs($ast, $xsyn)
+    }
+
     multi method deparse(
       RakuAST::ColonPair::False:D $ast, Str:D $xsyn = ""
     --> Str:D) {
@@ -1357,6 +1361,12 @@ CODE
             @parts.push(':');
         }
 
+        if $ast.sub-signature -> $signature {
+            @parts.push(' (');
+            @parts.push(self.deparse($signature));
+            @parts.push(')');
+        }
+
         @parts = self.hsyn('param', @parts.join);
         if $ast.default -> $default {
             @parts.push(self.syn-infix-ws($.assign) ~ self.deparse($default));
@@ -1451,7 +1461,8 @@ CODE
     }
 
     multi method deparse(RakuAST::Postfix::Power:D $ast --> Str:D) {
-        $ast.power.Str(:superscript)
+        self.deparse($ast.power)
+          .trans("0123456789-+i<>" => "⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺ⁱ", :delete)
     }
 
     multi method deparse(RakuAST::Postfix::Vulgar:D $ast --> Str:D) {

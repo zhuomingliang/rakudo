@@ -289,7 +289,7 @@ class Perl6::Metamodel::ClassHOW
             # only auto-generate a BUILDALL method if we have compiler
             # services. If we don't, then BUILDALL will fall back to the
             # one in Mu, which will iterate over the BUILDALLPLAN.
-            if nqp::isconcrete($compiler_services) {
+            if nqp::isconcrete($compiler_services) && nqp::can($compiler_services, 'generate_buildplan_executor') {
 
                 # Class does not appear to have a BUILDALL yet
                 unless self.declares_method($target, 'BUILDALL') {
@@ -299,8 +299,8 @@ class Perl6::Metamodel::ClassHOW
 
                     # We have a generated BUILDALL submethod, so install!
                     if nqp::isconcrete($method) {
-                        $method.set_name('BUILDALL');
-                        self.add_method($target, 'BUILDALL', $method);
+                        $method.set_name('POPULATE');
+                        self.add_method($target, 'POPULATE', $method);
                     }
                 }
             }

@@ -4,7 +4,7 @@ class RakuAST::CaptureSource
 
 # Everything that can appear as an expression does RakuAST::Expression.
 class RakuAST::Expression
-  is RakuAST::IMPL::ImmediateBlockUser
+  is RakuAST::MayCreateBlock
   is RakuAST::Sinkable
 {
     method needs-sink-call() { True }
@@ -16,6 +16,10 @@ class RakuAST::Expression
     # are visited ahead of parents. Adding to a linked list at the start is
     # cheapest.
     has Mu $!thunks;
+
+    method creates-block() {
+        $!thunks ?? True !! False
+    }
 
     method wrap-with-thunk(RakuAST::ExpressionThunk $thunk) {
         $thunk.set-next($!thunks) if $!thunks;
@@ -112,8 +116,23 @@ class RakuAST::Expression
         nqp::die("UNCURRY didn't find a CurryThunk");
     }
 
-    method IMPL-IMMEDIATELY-USES(RakuAST::Code $node) {
-        $!thunks ?? True !! False
+    method IMPL-REMOVE-THUNK(RakuAST::ExpressionThunk $thunk) {
+        my $prev-thunk;
+        my $cur-thunk := $!thunks;
+        while $cur-thunk {
+            if $cur-thunk =:= $thunk {
+                if $prev-thunk {
+                    $prev-thunk.set-next($cur-thunk.next);
+                }
+                else {
+                    nqp::bindattr(self, RakuAST::Expression, '$!thunks', $cur-thunk.next);
+                }
+                return;
+            }
+            $prev-thunk := $cur-thunk;
+            $cur-thunk := $cur-thunk.next;
+        }
+        nqp::die("IMPL-REMOVE-THUNK didn't find the thunk to remove");
     }
 
     method IMPL-ADJUST-QAST-FOR-LVALUE(Mu $qast) {
@@ -132,12 +151,12 @@ class RakuAST::OperatorProperties
         my $properties;
         if nqp::can(self, 'is-resolved') && self.is-resolved {
             my $resolution := self.resolution;
-            if nqp::istype($resolution, RakuAST::CompileTimeValue) {
+            if nqp::istype($resolution, RakuAST::CompileTimeValue) && nqp::can($resolution.compile-time-value, 'op_props') {
                 $properties := $resolution.compile-time-value.op_props;
             }
             elsif nqp::istype($resolution, RakuAST::Declaration::External) {
                 my $value := $resolution.maybe-compile-time-value;
-                $properties := $value.op_props if nqp::isconcrete($value);
+                $properties := $value.op_props if nqp::isconcrete($value) && nqp::can($value, 'op_props');
             }
         }
 
@@ -210,6 +229,10 @@ class RakuAST::Infixish
             $_.apply-sink($is-sunk);
         }
     }
+
+    method can-be-sunk() {
+        True
+    }
 }
 
 # A simple (non-meta) infix operator. Some of these are just function calls,
@@ -265,6 +288,10 @@ class RakuAST::Infix
             'orelse', True
         );
         SC{$!operator} // False
+    }
+
+    method can-be-sunk() {
+        $!operator ne ':='
     }
 
     method IMPL-OPERATOR() {
@@ -354,6 +381,11 @@ class RakuAST::Infix
                 nqp::die('Cannot compile bind to ' ~ $left.HOW.name($left));
             }
         }
+        elsif $op eq '=' {
+            my $left-qast := $left.IMPL-ADJUST-QAST-FOR-LVALUE($left.IMPL-TO-QAST($context));
+            my $right-qast := $right.IMPL-TO-QAST($context);
+            self.IMPL-ASSIGN-OP($left-qast, $right-qast);
+        }
         elsif nqp::existskey(OP-SMARTMATCH, $op)
             && (
                 !nqp::istype($right, RakuAST::Var)
@@ -408,6 +440,91 @@ class RakuAST::Infix
              )
     }
 
+    method IMPL-ASSIGN-OP(QAST::Node $lhs_ast, QAST::Node $rhs_ast) {
+        my $initialize := 0;
+        # The _i64 and _u64 are only used on backends that emulate int64/uint64
+        my @native_assign_ops := ['', 'assign_i', 'assign_n', 'assign_s', 'assign_i', 'assign_i', 'assign_i', 'assign_u', 'assign_u', 'assign_u', 'assign_u'];
+        my $past;
+        my $var_sigil;
+        if nqp::istype($lhs_ast, QAST::Var) {
+            $var_sigil := nqp::substr($lhs_ast.name, 0, 1);
+            if $var_sigil eq '%' {
+                if nqp::can($rhs_ast,'name') {
+                    my $name := $rhs_ast.name;
+                    if $name ~~ /^ '&circumfix:<' ':'? '{ }>' $/ {
+                        self.add-worry("Useless use of hash composer on right side of hash assignment; did you mean := instead?");
+                    }
+                }
+            }
+        }
+
+        # get the sigil out of the my %h is Set = case
+        elsif nqp::istype($lhs_ast,QAST::Op) && $lhs_ast.op eq 'bind'
+          && nqp::istype($lhs_ast[0], QAST::Var) {
+            $var_sigil := nqp::substr($lhs_ast[0].name, 0, 1);
+        }
+
+        if nqp::istype($lhs_ast, QAST::Var)
+                && (my $spec := nqp::objprimspec($lhs_ast.returns)) {
+            # Native assignment is only possible to a reference; complain now
+            # rather than at runtime since we'll inevitably fail.
+            my $scope := $lhs_ast.scope;
+            if $scope ne 'lexicalref' && $scope ne 'attributeref' {
+                nqp::die("RO assignment");
+                $lhs_ast.node.typed_sorry('X::Assignment::RO::Comp',
+                    variable => $lhs_ast.name);
+            }
+            $past := QAST::Op.new(
+                :op(@native_assign_ops[$spec]), :returns($lhs_ast.returns),
+                $lhs_ast, $rhs_ast);
+        }
+        elsif $var_sigil eq '@' || $var_sigil eq '%' {
+            # While the scalar container store op would end up calling .STORE,
+            # it may do it in a nested runloop, which gets pricey. This is a
+            # simple heuristic check to try and avoid that by calling .STORE.
+            $past := QAST::Op.new(
+                :op('callmethod'), :name('STORE'),
+                $lhs_ast, $rhs_ast);
+
+            # let STORE know if this is the first time
+            if $initialize {
+                $past.push(QAST::WVal.new(
+                  :named('INITIALIZE'),
+                  :value(True),
+                ));
+            }
+            $past.nosink(1);
+        }
+        elsif $var_sigil eq '$' {
+            # If it's a $ scalar, we can assume it's some kind of scalar
+            # container with a container spec, so can go directly for a
+            # Scalar assign op (via. a level of indirection so that any
+            # platform that wants to optimize this somewhat can).
+            $past := QAST::Op.new( :op('p6assign'), $lhs_ast, $rhs_ast );
+        }
+        elsif nqp::istype($lhs_ast, QAST::Op) && $lhs_ast.op eq 'call' &&
+              ((my $lhs_ast_name := $lhs_ast.name) eq '&postcircumfix:<[ ]>' ||
+               $lhs_ast_name eq '&postcircumfix:<{ }>' ||
+               $lhs_ast_name eq '&postcircumfix:<[; ]>') &&
+                +@($lhs_ast) == 2 { # no adverbs
+            $lhs_ast.push($rhs_ast);
+            $past := $lhs_ast;
+            $past.nosink(1);
+        }
+        elsif nqp::istype($lhs_ast, QAST::Op) && $lhs_ast.op eq 'hllize' &&
+                nqp::istype($lhs_ast[0],QAST::Op) && $lhs_ast[0].op eq 'call' &&
+                ($lhs_ast[0].name eq '&postcircumfix:<[ ]>' || $lhs_ast[0].name eq '&postcircumfix:<{ }>') &&
+                +@($lhs_ast[0]) == 2 { # no adverbs
+            $lhs_ast[0].push($rhs_ast);
+            $past := $lhs_ast;
+            $past.nosink(1);
+        }
+        else {
+            $past := QAST::Op.new(:op('p6store'), $lhs_ast, $rhs_ast);
+        }
+        $past
+    }
+
     method IMPL-INFIX-FOR-META-QAST(
       RakuAST::IMPL::QASTContext $context,
                               Mu $left-qast,
@@ -427,18 +544,32 @@ class RakuAST::Infix
                                  int $negate ) {
         # Handle cases of s/// or m// separately. For a non-negating smartmatch this case could've been reduced to
         # plain topic localization except that we must ensure a False returned when there is no match.
-        if nqp::istype($right, RakuAST::RegexThunk)
+        if (nqp::istype($right, RakuAST::RegexThunk) || nqp::istype($right, RakuAST::Transliteration))
             && (!nqp::can($right, 'match-immediately') || $right.match-immediately)
         {
             my $match-type :=
               self.get-implicit-lookups.AT-POS(0).resolution.compile-time-value;
             my $result-local := QAST::Node.unique('!sm-result');
             my $rhs := $right.IMPL-EXPR-QAST($context);
+
+            my $boolify := 0;
+            my $sm-call := QAST::Op.new(
+                :op<bind>,
+                QAST::Var.new( :name($result-local), :scope('local'), :decl('var') ),
+                QAST::Op.new(
+                    :op<dispatch>,
+                    QAST::SVal.new( :value<raku-smartmatch> ),
+                    QAST::Var.new( :name('$_'), :scope('lexical') ),
+                    $rhs,
+                    QAST::IVal.new( :value( $negate ?? -1 !! $boolify ) )
+                )
+            );
+            $sm-call[1].annotate('smartmatch_accepts', 1);
+            $sm-call[1].annotate('smartmatch_negated', $negate);
+
             return self.IMPL-TEMPORARIZE-TOPIC(
                 $left.IMPL-TO-QAST($context),
-                $negate
-                    ?? QAST::Op.new( :op<callmethod>, :name<not>, $rhs)
-                    !! QAST::Op.new( :op<unless>, $rhs, QAST::WVal.new( :value(False) )));
+                $sm-call);
         }
 
         my $accepts-call;
@@ -500,6 +631,38 @@ class RakuAST::Infix
     method IMPL-HOP-INFIX-QAST(RakuAST::IMPL::QASTContext $context) {
         my $name := self.resolution.lexical-name;
         QAST::Var.new( :scope('lexical'), :$name )
+    }
+
+    method IMPL-APPLY-SINK-TO-OPERANDS(List $operands, Bool $is-sunk) {
+        if $!operator eq ':=' || $!operator eq '⚛=' {
+            # We don't sink anything when binding. In fact binding is a way to specifically avoid sinking.
+            my $i := 0;
+            while $i < nqp::elems($operands) {
+                $operands[$i].apply-sink(False);
+                $i++;
+            }
+        }
+        elsif $!operator eq '⚛=' {
+            $operands[0].apply-sink($is-sunk); # Only target of atomic assignment can be sunk
+            my $i := 1;
+            while $i < nqp::elems($operands) {
+                $operands[$i].apply-sink(False);
+                $i++;
+            }
+        }
+        elsif self.short-circuit { # Only final part of short-circuiting operators can be sunk
+            my $i := 0;
+            while $i < nqp::elems($operands) - 1 {
+                $operands[$i].apply-sink(False);
+                $i++;
+            }
+            $operands[$i].apply-sink($is-sunk);
+        }
+        else {
+            for $operands {
+                $_.apply-sink($is-sunk);
+            }
+        }
     }
 
     method IMPL-CAN-INTERPRET() {
@@ -897,6 +1060,10 @@ class RakuAST::Assignment
             $i++;
         }
     }
+
+    method can-be-sunk() {
+        False
+    }
 }
 
 # A bracketed infix.
@@ -1029,6 +1196,8 @@ class RakuAST::MetaInfix::Assign
         $obj
     }
 
+    method operator() { '=' }
+
     method visit-children(Code $visitor) {
         $visitor($!infix);
     }
@@ -1080,8 +1249,6 @@ class RakuAST::MetaInfix::Assign
     method IMPL-OPERATOR() {
         self.get-implicit-lookups.AT-POS(0).resolution.compile-time-value
     }
-
-    method IMPL-CURRIES() { 0 }
 
     method IMPL-INFIX-QAST(RakuAST::IMPL::QASTContext $context, Mu $left-qast, Mu $right-qast) {
         if self.IMPL-IS-TEST {
@@ -1859,6 +2026,10 @@ class RakuAST::ApplyInfix
         $!infix.IMPL-APPLY-SINK-TO-OPERANDS($operands, $is-sunk);
     }
 
+    method needs-sink-call() {
+        $!infix.can-be-sunk
+    }
+
     method IMPL-CAN-INTERPRET() {
         $!infix.IMPL-CAN-INTERPRET && $!args.IMPL-CAN-INTERPRET
     }
@@ -2045,6 +2216,10 @@ class RakuAST::ApplyDottyInfix
     }
 
     method properties() { $!infix.properties }
+
+    method needs-sink-call() {
+        nqp::istype($!infix, RakuAST::DottyInfix::CallAssign) ?? False !! True
+    }
 
     method IMPL-EXPR-QAST(RakuAST::IMPL::QASTContext $context) {
         $!infix.IMPL-DOTTY-INFIX-QAST: $context,

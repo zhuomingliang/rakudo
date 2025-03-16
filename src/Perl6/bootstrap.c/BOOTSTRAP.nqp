@@ -2085,7 +2085,12 @@ BEGIN {
         # The value can also be a string that will be shown in the error
         # message if this named argument is *not* specified.  Make sure it
         # is added to the serialization context.
-        $*W.add_object_if_no_sc($value);  # XXX RakuAST
+        if ($*W) {
+            $*W.add_object_if_no_sc($value);
+        }
+        elsif ($*CU) {
+            $*CU.context.ensure-sc($value);
+        }
         nqp::bindattr($self, Attribute, '$!required', $value);
         nqp::hllboolfor(1, "Raku")
     }));
@@ -3766,6 +3771,7 @@ BEGIN {
         $i := 0;
         while $i < $m {
             my $node_i := nqp::atpos(@graph, $i);
+            my $node_i_possible := $node_i.possible;
 
             my int $j;
             while $j < $m {
@@ -3773,7 +3779,7 @@ BEGIN {
                     my $node_j := nqp::atpos(@graph, $j);
 
                     $node_i.push_outer_edge($node_j)
-                      if is_narrower($node_i.possible, $node_j.possible);
+                      if is_narrower($node_i_possible, $node_j.possible);
                 }
                 ++$j;
             }

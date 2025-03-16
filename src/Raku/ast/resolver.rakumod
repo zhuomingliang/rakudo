@@ -35,6 +35,14 @@ class RakuAST::Resolver {
         $clone
     }
 
+    method IMPL-CLONE-ATTACH-TARGETS() {
+        my %attach-targets;
+        for $!attach-targets {
+            %attach-targets{$_.key} := nqp::clone($_.value);
+        }
+        %attach-targets
+    }
+
     # Push an attachment target, so children can attach to it.
     method push-attach-target(RakuAST::AttachTarget $target) {
         for $target.IMPL-UNWRAP-LIST($target.attach-target-names()) -> str $name {
@@ -63,10 +71,10 @@ class RakuAST::Resolver {
     # Find the current (most recently pushed) attachment target with the
     # specified name, or return Nil if there is no target by the given name,
     # or no targets left for the given name.
-    method find-attach-target(str $name) {
+    method find-attach-target(str $name, Bool :$skip-first) {
         my @stack := $!attach-targets{$name};
-        nqp::isconcrete(@stack) && nqp::elems(@stack)
-          ?? @stack[nqp::elems(@stack) - 1]
+        nqp::isconcrete(@stack) && nqp::elems(@stack) > +$skip-first
+          ?? @stack[nqp::elems(@stack) - (1 + $skip-first)]
           !! Nil
     }
 
@@ -175,9 +183,9 @@ class RakuAST::Resolver {
     }
 
     # Resolve a RakuAST::Name to a constant.
-    method resolve-name-constant(RakuAST::Name $Rname, str :$sigil) {
-        self.IMPL-RESOLVE-NAME-CONSTANT($Rname, :$sigil)
-          // self.IMPL-RESOLVE-NAME-IN-PACKAGES($Rname, :$sigil)
+    method resolve-name-constant(RakuAST::Name $Rname, str :$sigil, :$current-scope-only) {
+        self.IMPL-RESOLVE-NAME-CONSTANT($Rname, :$sigil, :$current-scope-only)
+          // ($current-scope-only ?? Nil !! self.IMPL-RESOLVE-NAME-IN-PACKAGES($Rname, :$sigil))
     }
 
     # Resolve a RakuAST::Name to a constant looking only in the setting.
@@ -256,6 +264,7 @@ class RakuAST::Resolver {
       RakuAST::Name  $constant,
                Bool :$setting,
                Bool :$partial,
+               Bool :$current-scope-only,
                 str :$sigil
     ) {
         my @parts := nqp::clone($constant.IMPL-UNWRAP-LIST($constant.parts));
@@ -277,6 +286,12 @@ class RakuAST::Resolver {
         my str $setting-rev;
         if ($name eq 'CORE') {
             $root := nqp::shift(@parts);
+            if nqp::istype($root, RakuAST::Name::Part::Empty) {
+                return Nil;
+            }
+            elsif nqp::istype($root, RakuAST::Name::Part::Expression) && !$root.has-compile-time-name {
+                return Nil;
+            }
             $name := $root.name;
             $setting := True;
             if (nqp::chars($name) == 3 && nqp::index($name, 'v6') == 0) {
@@ -293,7 +308,7 @@ class RakuAST::Resolver {
                )
             !! $setting
               ?? self.resolve-lexical-constant-in-setting($name, :$setting-rev)
-              !! self.resolve-lexical-constant($name);
+              !! self.resolve-lexical-constant($name, :$current-scope-only);
         $resolved
           ?? (my $symbol := $resolved.compile-time-value)
           !! (return Nil);
@@ -308,7 +323,7 @@ class RakuAST::Resolver {
                   !! '';
 
                 # Add any sigil for last iteration
-                $name := $sigil ~ $name unless @parts;
+                $name := $sigil ~ $name ~ $constant.colonpair-suffix unless @parts;
 
                 # Lookup in the current symbol's stash
                 my $next := nqp::atkey(self.IMPL-STASH-HASH($symbol),$name);
@@ -781,11 +796,28 @@ class RakuAST::Resolver::EVAL
 
     # Resolves a lexical to its declaration. The declaration must have a
     # compile-time value.
-    method resolve-lexical-constant(Str $name) {
+    method resolve-lexical-constant(Str $name, Bool :$current-scope-only) {
 
         # No need to look further
         if $name eq 'GLOBAL' {
             self.global-package;
+        }
+
+        # If it's in the current scope only, just look at the top one, if any
+        elsif $current-scope-only {
+            my @scopes := $!scopes;
+            my $found := nqp::elems(@scopes)
+                ?? @scopes[nqp::elems(@scopes) - 1].find-lexical($name)
+                !! Nil;
+            if nqp::isconcrete($found) {
+                if nqp::istype($found,RakuAST::CompileTimeValue) {
+                    return $found;
+                }
+                else {
+                    nqp::die("Symbol '$name' does not have a compile-time value");
+                }
+            }
+            Nil
         }
 
         # Walk active scopes, most nested first.
@@ -826,11 +858,11 @@ class RakuAST::Resolver::Compile
     has Mu $!worries;
 
     # Create a resolver from given arguments
-    method new(Mu :$setting!, Mu :$outer!, Mu :$global!, Mu :$scopes) {
+    method new(Mu :$setting!, Mu :$outer!, Mu :$global!, Mu :$scopes, Mu :$attach-targets) {
         my $obj := nqp::create(self);
         nqp::bindattr($obj, RakuAST::Resolver, '$!setting', $setting);
         nqp::bindattr($obj, RakuAST::Resolver, '$!outer', $outer);
-        nqp::bindattr($obj, RakuAST::Resolver, '$!attach-targets', nqp::hash());
+        nqp::bindattr($obj, RakuAST::Resolver, '$!attach-targets', $attach-targets // nqp::hash());
         nqp::bindattr($obj, RakuAST::Resolver, '$!global', $global);
         nqp::bindattr($obj, RakuAST::Resolver, '$!packages', []);
 
@@ -851,7 +883,8 @@ class RakuAST::Resolver::Compile
             :$setting,
             :outer($resolver ?? $setting !! $context),
             :$global,
-            :scopes($resolver ?? nqp::getattr($resolver, RakuAST::Resolver::Compile, '$!scopes') !! Mu)
+            :scopes($resolver ?? nqp::clone(nqp::getattr($resolver, RakuAST::Resolver::Compile, '$!scopes')) !! Mu),
+            :attach-targets($resolver ?? $resolver.IMPL-CLONE-ATTACH-TARGETS !! Mu),
         )
     }
 
@@ -956,6 +989,12 @@ class RakuAST::Resolver::Compile
     # declaration, so that we can resolve it without requiring it to be
     # linked into the tree.
     method declare-lexical(RakuAST::Declaration $decl) {
+        CATCH {
+            if nqp::istype(nqp::getpayload($_), RakuAST::Exception::TooComplex) {
+                self.build-exception('X::Syntax::Extension::TooComplex', name => nqp::getpayload($_).name).throw;
+            }
+            nqp::rethrow($_);
+        }
         $!scopes[nqp::elems($!scopes) - 1].declare-lexical($decl)
     }
 
@@ -963,6 +1002,12 @@ class RakuAST::Resolver::Compile
     # Used when the compiler produces the declaration, but already entered into
     # that declaration's inner scope.
     method declare-lexical-in-outer(RakuAST::Declaration $decl) {
+        CATCH {
+            if nqp::istype(nqp::getpayload($_), RakuAST::Exception::TooComplex) {
+                self.build-exception('X::Syntax::Extension::TooComplex', name => nqp::getpayload($_).name).throw;
+            }
+            nqp::rethrow($_);
+        }
         $!scopes[nqp::elems($!scopes) - 2].declare-lexical($decl)
     }
 
@@ -994,9 +1039,27 @@ class RakuAST::Resolver::Compile
 
     # Resolves a lexical to its declaration. The declaration must have a
     # compile-time value.
-    method resolve-lexical-constant(Str $name) {
+    method resolve-lexical-constant(Str $name, Bool :$current-scope-only) {
         if $name eq 'GLOBAL' {
             return self.global-package;
+        }
+
+        # If it's in the current scope only, just look at the top one, if any
+        if $current-scope-only {
+            my @scopes := $!scopes;
+            my int $i := nqp::elems(@scopes);
+            if ($i > 0) {
+                my $found := @scopes[$i - 1].find-lexical($name);
+                if nqp::isconcrete($found) {
+                    if nqp::istype($found, RakuAST::CompileTimeValue) {
+                        return $found;
+                    }
+                    else {
+                        nqp::die("Symbol '$name' does not have a compile-time value");
+                    }
+                }
+            }
+            return Nil;
         }
 
         # Walk active scopes, most nested first.
@@ -1318,7 +1381,7 @@ class RakuAST::Resolver::Compile::Scope
         nqp::die('Should not be calling declare-lexical in batch mode')
           if $!batch-mode;
         my $name    := $decl.lexical-name;
-        my $existed := nqp::existskey($!live-decl-map, $name);
+        my $existed := nqp::atkey($!live-decl-map, $name);
         $!live-decl-map{$decl.lexical-name} := $decl;
         $existed
     }

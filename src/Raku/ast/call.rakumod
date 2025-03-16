@@ -5,6 +5,7 @@ class RakuAST::ArgList
 {
     has List $!args;
     has RakuAST::Expression $.invocant;
+    has Bool $!on-return;
 
     method new(*@args) {
         my $obj := nqp::create(self);
@@ -39,6 +40,10 @@ class RakuAST::ArgList
     method set-arg-at-pos(int $pos, RakuAST::Expression $arg) {
         nqp::bindpos($!args,$pos,$arg);
         Nil
+    }
+
+    method set-on-return(Bool $on-return) {
+        nqp::bindattr(self, RakuAST::ArgList, '$!on-return', $on-return);
     }
 
     method push($arg) {
@@ -105,7 +110,7 @@ class RakuAST::ArgList
                     :flat(1), :named(1)
                 ));
             }
-            elsif nqp::istype($arg, RakuAST::NamedArg) {
+            elsif nqp::istype($arg, RakuAST::NamedArg) && !$!on-return {
                 my $name := $arg.named-arg-name;
                 if %named-counts{$name} == 1 {
                     # It's the final appearance of this name, so emit it as the
@@ -178,9 +183,9 @@ class RakuAST::ArgList
         [@pos, %named]
     }
 
-    method IMPL-HAS-ONLY-COMPILE-TIME-VALUES() {
+    method IMPL-HAS-ONLY-COMPILE-TIME-VALUES(:$allow-generic) {
         for $!args -> $arg {
-            return False unless nqp::istype($arg, RakuAST::CompileTimeValue);
+            return False if !nqp::istype($arg, RakuAST::CompileTimeValue) || (!$allow-generic && $arg.compile-time-value.HOW.archetypes.generic);
         }
         True
     }
@@ -209,17 +214,24 @@ class RakuAST::Call {
         $!args.push($pair);
         Nil
     }
+
+    method replace-args(RakuAST::ArgList $args) {
+        nqp::bindattr(self, RakuAST::Call, '$!args', $args);
+    }
 }
 
 # A call to a named sub.
 class RakuAST::Call::Name
   is RakuAST::Term
   is RakuAST::Call
+  is RakuAST::ParseTime
   is RakuAST::BeginTime
   is RakuAST::CheckTime
   is RakuAST::Lookup
 {
     has RakuAST::Name $.name;
+    has RakuAST::Code $!block;
+    has Mu $!lexical; # For top-level package if we can only partially resolve
     has Mu $!package;
 
     method new(RakuAST::Name :$name!, RakuAST::ArgList :$args) {
@@ -246,6 +258,11 @@ class RakuAST::Call::Name
         RakuAST::UndeclaredSymbolDescription::Routine.new($!name.canonicalize())
     }
 
+    method PERFORM-PARSE(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
+        nqp::bindattr(self, RakuAST::Call::Name, '$!block',
+            $resolver.find-attach-target('block'));
+    }
+
     method PERFORM-BEGIN(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         nqp::bindattr(self, RakuAST::Call::Name, '$!package', $resolver.current-package);
         my $resolved := $!name.is-identifier
@@ -264,10 +281,33 @@ class RakuAST::Call::Name
                 }
             }
         }
+
+        if !$resolved && $!name.is-multi-part {
+            my $resolved := $resolver.resolve-lexical-constant($!name.parts.AT-POS(0).name);
+            if $resolved {
+                nqp::bindattr(self, RakuAST::Call::Name, '$!lexical', $resolved);
+            }
+        }
+
+        if $!name.canonicalize eq 'return' {
+            self.args.set-on-return(True);
+        }
     }
 
     method PERFORM-CHECK(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         my int $ARG_IS_LITERAL := 32;
+
+        my $block := $!block;
+        if $!name.canonicalize eq 'return'
+            && $block && $block.signature && (my $ret := $block.signature.returns)
+            && $ret.has-compile-time-value
+            && (nqp::isconcrete($ret.maybe-compile-time-value) || nqp::istype($ret.maybe-compile-time-value, Nil))
+            && self.args && self.args.has-args {
+            self.add-sorry(
+                $resolver.build-exception: 'X::Comp::AdHoc',
+                    payload => "No return arguments allowed when return value {$block.signature.returns.DEPARSE} is already specified in the signature",
+            );
+        }
 
         unless self.is-resolved {
             self.PERFORM-BEGIN($resolver, $context);
@@ -314,16 +354,32 @@ class RakuAST::Call::Name
                                 @types[$i].HOW.name(@types[$i]));
                         }
 
+                        my $protoguilt := @ct_result_multi && $ct_result == -1 ?? True !! False;
+                        my $signature := self.IMPL-WRAP-LIST(
+                            nqp::can($routine, 'is_dispatcher') && $routine.is_dispatcher && !$protoguilt
+                                ?? self.IMPL-MULTI-SIG-LIST($routine)
+                                !! [try $routine.signature.gist]
+                        );
+
                         self.add-sorry(
                             $resolver.build-exception: 'X::TypeCheck::Argument',
                                 :objname($!name.canonicalize),
+                                :$signature,
                                 :arguments(@arg_names),
-                                :protoguilt(@ct_result_multi && $ct_result == -1 ?? True !! False),
+                                :$protoguilt,
                         );
                     }
                 }
             }
         }
+    }
+
+    method IMPL-MULTI-SIG-LIST($dispatcher) {
+        my @sigs := [];
+        for $dispatcher.dispatchees {
+            @sigs.push("\n    " ~ $_.signature.gist);
+        }
+        @sigs
     }
 
     method IMPL-EXPR-QAST(RakuAST::IMPL::QASTContext $context) {
@@ -336,12 +392,8 @@ class RakuAST::Call::Name
                 return RakuAST::Nqp.new($op, self.args).IMPL-TO-QAST($context);
             }
             elsif $!name.is-package-lookup {
-                return self.is-resolved
-                    ?? $!name.IMPL-QAST-PACKAGE-LOOKUP(
-                        $context,
-                        $!package,
-                        :lexical(self.resolution)
-                    )
+                return self.is-resolved && !$!name.is-global-lookup
+                    ?? QAST::Op.new(:op<who>, self.resolution.IMPL-LOOKUP-QAST($context))
                     !! $!name.IMPL-QAST-PACKAGE-LOOKUP(
                         $context,
                         $!package
@@ -354,16 +406,35 @@ class RakuAST::Call::Name
                 $call.push(
                     self.is-resolved
                         ?? self.resolution.IMPL-LOOKUP-QAST($context)
-                        !! $!name.IMPL-QAST-PACKAGE-LOOKUP(
-                            $context,
-                            $!package,
-                            :sigil<&>,
-                            :global-fallback,
-                        )
+                        !! $!lexical
+                            ?? $!name.IMPL-QAST-PACKAGE-LOOKUP(
+                                $context,
+                                $!package,
+                                :lexical($!lexical),
+                                :sigil<&>,
+                                :global-fallback,
+                            )
+                            !! $!name.IMPL-QAST-PACKAGE-LOOKUP(
+                                $context,
+                                $!package,
+                                :sigil<&>,
+                                :global-fallback,
+                            )
                 );
             }
         }
         self.args.IMPL-ADD-QAST-ARGS($context, $call);
+
+        # Add return value from signature if this is a return without args
+        my $block := $!block;
+        if $!name.canonicalize eq 'return'
+            && $block && $block.signature && (my $ret := $block.signature.returns)
+            && $ret.has-compile-time-value
+            && (nqp::isconcrete($ret.maybe-compile-time-value) || nqp::istype($ret.maybe-compile-time-value, Nil))
+        {
+            $call.push(QAST::WVal.new(:value($ret.maybe-compile-time-value)));
+        }
+
         $call
     }
 
@@ -526,14 +597,13 @@ class RakuAST::Call::Method
     }
 
     method PRODUCE-IMPLICIT-LOOKUPS() {
-        my $name := $!name.canonicalize;
         my @lookups := [];
-        if $name {
-            my @parts := nqp::split('::', $name);
-            if nqp::elems(@parts) > 1 {
-                @parts.pop;
-                @lookups.push: # joining @parts with '::' gives use the qualifying type of the name
-                    RakuAST::Type::Simple.new: RakuAST::Name.from-identifier: nqp::join('::', @parts);
+        if $!name {
+            my @parts := nqp::clone($!name.IMPL-UNWRAP-LIST($!name.parts));
+            @parts.pop;
+            if @parts {
+                @lookups.push:
+                    RakuAST::Type::Simple.new: RakuAST::Name.new: |@parts;
             }
         }
         self.IMPL-WRAP-LIST(@lookups)
@@ -784,6 +854,7 @@ class RakuAST::Call::PrivateMethod
   is RakuAST::Lookup
   is RakuAST::ImplicitLookups
   is RakuAST::ParseTime
+  is RakuAST::CheckTime
 {
     has RakuAST::Name $.name;
     has Mu $!package;
@@ -806,7 +877,29 @@ class RakuAST::Call::PrivateMethod
 
     method PERFORM-PARSE(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         nqp::bindattr(self, RakuAST::Call::PrivateMethod, '$!package', $resolver.current-package);
+        if $!name.is-multi-part {
+            my @parts := nqp::clone($!name.IMPL-UNWRAP-LIST($!name.parts));
+            my $name := nqp::pop(@parts);
+            my $package-name := RakuAST::Name.new(|@parts);
+            my $resolution := $resolver.resolve-name-constant($package-name);
+            if $resolution {
+                self.set-resolution($resolution);
+            }
+        }
         Nil
+    }
+
+    method PERFORM-CHECK(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
+        if $!name.is-multi-part && self.is-resolved {
+            my $methpkg := self.resolution.compile-time-value;
+            unless nqp::can($methpkg.HOW, 'is_trusted') && $methpkg.HOW.is_trusted($methpkg, $!package) {
+                self.add-sorry:
+                    $resolver.build-exception: 'X::Method::Private::Permission',
+                        :method(         $!name.last-part.name),
+                        :source-package( $methpkg.HOW.name($methpkg)),
+                        :calling-package( $!package.HOW.name($!package));
+            }
+        }
     }
 
     method PRODUCE-IMPLICIT-LOOKUPS() {
@@ -816,23 +909,43 @@ class RakuAST::Call::PrivateMethod
     }
 
     method IMPL-POSTFIX-QAST(RakuAST::IMPL::QASTContext $context, Mu $invocant-qast) {
+        my $call;
         if $!name.is-identifier {
             my $name := self.IMPL-UNWRAP-LIST($!name.parts)[0].name;
-            my $call := QAST::Op.new(
+            my $package := $!package;
+            if nqp::can($package.HOW, 'archetypes') && !$package.HOW.archetypes.generic && !$package.HOW.archetypes.parametric && nqp::can($package.HOW, 'find_private_method') {
+                my $meth := $package.HOW.find_private_method($package, $name);
+                if nqp::defined($meth) && $meth {
+                    $context.ensure-sc($meth);
+                    my $call := QAST::Op.new(:op('call'), QAST::WVal.new( :value($meth) ), $invocant-qast);
+                    self.args.IMPL-ADD-QAST-ARGS($context, $call);
+                    return $call;
+                }
+                else {
+                    nqp::die("Private method $name not found on " ~ $package.HOW.name($package));
+                }
+            }
+            $call := QAST::Op.new(
                 :op('callmethod'),
                 :name('dispatch:<!>'),
                 $invocant-qast,
                 RakuAST::StrLiteral.new($name).IMPL-EXPR-QAST($context),
                 $!package.HOW.archetypes.parametric
-                  ?? self.get-implicit-lookups.AT-POS(0).IMPL-EXPR-QAST($context)
+                  ?? self.IMPL-UNWRAP-LIST(self.get-implicit-lookups)[0].IMPL-EXPR-QAST($context)
                   !! QAST::WVal.new(:value($!package)),
             );
-            self.args.IMPL-ADD-QAST-ARGS($context, $call);
-            $call
         }
         else {
-            nqp::die('Qualified private method calls NYI');
+            $call := QAST::Op.new(
+                :op('callmethod'),
+                :name('dispatch:<!>'),
+                $invocant-qast,
+                RakuAST::StrLiteral.new($!name.last-part.name).IMPL-EXPR-QAST($context),
+                self.resolution.IMPL-TO-QAST($context),
+            );
         }
+        self.args.IMPL-ADD-QAST-ARGS($context, $call);
+        $call
     }
 }
 
