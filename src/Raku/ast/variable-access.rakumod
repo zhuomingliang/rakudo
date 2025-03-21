@@ -42,6 +42,16 @@ class RakuAST::Var::Lexical
         self.is-resolved ?? self.resolution.can-be-bound-to !! False
     }
 
+    method can-be-assigned-to() {
+        self.is-resolved ?? self.resolution.can-be-assigned-to !! False
+    }
+
+    method build-assign-exception(RakuAST::Resolver $resolver) {
+        self.is-resolved
+            ?? self.resolution.build-assign-exception($resolver)
+            !! nqp::findmethod(RakuAST::Node, 'build-assign-exception')(self, $resolver)
+    }
+
     method build-bind-exception(RakuAST::Resolver $resolver) {
         self.is-resolved
             ?? self.resolution.build-bind-exception($resolver)
@@ -57,10 +67,7 @@ class RakuAST::Var::Lexical
 
     method PERFORM-CHECK(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         unless self.is-resolved {
-            my $resolved := $resolver.resolve-lexical(self.name);
-            if $resolved {
-                self.set-resolution($resolved);
-            }
+            self.PERFORM-PARSE($resolver, $context);
         }
         if self.is-resolved && nqp::istype(self.resolution, RakuAST::VarDeclaration::AttributeAlias) {
             my $self := RakuAST::Term::Self.new.to-begin-time($resolver, $context);

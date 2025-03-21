@@ -569,7 +569,7 @@ class RakuAST::VarDeclaration::Simple
     has RakuAST::Expression  $.where;
     has RakuAST::Type        $.original-type;
     has Bool                 $!is-parameter;
-    has Bool                 $!is-rw;
+    has Bool                 $.is-rw;
     has Bool                 $!is-ro;
     has Bool                 $!is-bindable;
     has Bool                 $!already-declared;
@@ -685,6 +685,8 @@ class RakuAST::VarDeclaration::Simple
             nqp::die('Cannot generate lookup of simple var for scope ' ~ self.scope);
         }
     }
+
+    method can-be-assigned-to() { True }
 
     method can-be-bound-to() {
         # Must be lexical and non-native.
@@ -1043,7 +1045,7 @@ class RakuAST::VarDeclaration::Simple
 
                 my $expression := $initializer.expression;
                 if nqp::istype($expression,RakuAST::Literal) {
-                    my $vartype := $type.PRODUCE-META-OBJECT;
+                    my $vartype := $type.meta-object;
                     if nqp::objprimspec($vartype) {
                         $vartype := $vartype.HOW.mro($vartype)[1];
                     }

@@ -3042,6 +3042,13 @@ my class X::Assignment::RO::Comp does X::Comp {
     }
 }
 
+my class X::Assignment::Immutable::Comp does X::Comp {
+    has $.variable;
+    method message {
+        "Cannot assign to immutable variable {$.variable}"
+    }
+}
+
 my class X::Immutable is Exception {
     has $.typename;
     has $.method;

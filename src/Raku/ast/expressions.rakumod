@@ -489,11 +489,7 @@ class RakuAST::Infix
             # Native assignment is only possible to a reference; complain now
             # rather than at runtime since we'll inevitably fail.
             my $scope := $lhs_ast.scope;
-            if $scope ne 'lexicalref' && $scope ne 'attributeref' {
-                nqp::die("RO assignment");
-                $lhs_ast.node.typed_sorry('X::Assignment::RO::Comp',
-                    variable => $lhs_ast.name);
-            }
+
             $past := QAST::Op.new(
                 :op(@native_assign_ops[$spec]), :returns($lhs_ast.returns),
                 $lhs_ast, $rhs_ast);
@@ -2000,6 +1996,10 @@ class RakuAST::ApplyInfix
 
         # a "normal" infix op
         elsif nqp::istype($infix, RakuAST::Infix) {
+            if $infix.operator eq '=' && !$left.can-be-assigned-to {
+                self.add-sorry: $left.build-assign-exception($resolver);
+            }
+
             if $infix.operator eq ':=' && !$left.can-be-bound-to {
                 self.add-sorry: $left.build-bind-exception($resolver);
             }

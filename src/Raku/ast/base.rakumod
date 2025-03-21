@@ -45,6 +45,10 @@ class RakuAST::Node {
     # and False otherwise.
     method can-be-bound-to() { False }
 
+    method build-assign-exception(RakuAST::Resolver $resolver) {
+        nqp::die('build-assign-exception NYI');
+    }
+
     # Builds the exception thrown when this cannot be bound to, but someone
     # tries to do so anyway.
     method build-bind-exception(RakuAST::Resolver $resolver) {

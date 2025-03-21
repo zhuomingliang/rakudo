@@ -1893,8 +1893,16 @@ class RakuAST::ParameterTarget::Var
         nqp::substr($!name, self.twigil ?? 2 !! 1)
     }
 
+    method can-be-assigned-to() { $!declaration.is-rw }
+
     method can-be-bound-to() {
         $!is-bindable
+    }
+
+    method build-assign-exception(RakuAST::Resolver $resolver) {
+        $resolver.build-exception:
+            nqp::objprimspec($!declaration.type.stubbed-meta-object) ?? 'X::Assignment::RO::Comp' !! 'X::Assignment::Immutable::Comp',
+                :variable(self.lexical-name)
     }
 
     method build-bind-exception(RakuAST::Resolver $resolver) {
