@@ -94,7 +94,7 @@ class RakuAST::Signature
                         self.add-sorry: $resolver.build-exception: 'X::Parameter::WrongOrder', misplaced => 'required', after => 'named', parameter => $_.target.name;
                     }
 
-                } elsif $kind := 2 {           # optional
+                } elsif $kind =:= 2 {          # optional
                     if $prev-kind =:= 4 {      # variadic
                         self.add-sorry: $resolver.build-exception: 'X::Parameter::WrongOrder', misplaced => 'required', after => 'variadic', parameter => $_.target.name;
                     } elsif $prev-kind =:= 1 { # named

@@ -36,7 +36,7 @@ class RakuAST::ArgList
         $obj
     }
 
-    method arg-at-pos(int $pos) { nqp::atpos($!args,$pos) }
+    method arg-at-pos(int $pos) { nqp::atpos($!args, $pos) }
     method set-arg-at-pos(int $pos, RakuAST::Expression $arg) {
         nqp::bindpos($!args,$pos,$arg);
         Nil
@@ -314,22 +314,42 @@ class RakuAST::Call::Name
     }
 
     method PERFORM-CHECK(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
-        my int $ARG_IS_LITERAL := 32;
+        unless self.is-resolved {
+            self.PERFORM-BEGIN($resolver, $context);
+        }
 
-        my $block := $!block;
-        if $!name.canonicalize eq 'return'
-            && $block && $block.signature && (my $ret := $block.signature.returns)
-            && $ret.has-compile-time-value
-            && (nqp::isconcrete($ret.maybe-compile-time-value) || nqp::istype($ret.maybe-compile-time-value, Nil))
-            && self.args && self.args.has-args {
+        my int $ARG_IS_LITERAL := 32;
+        my $args  := self.IMPL-UNWRAP-LIST(self.args.args);
+        if $args {
+            my $block := $!block;
+            my $parameters := self.IMPL-UNWRAP-LIST($block ?? $block.signature.parameters !!
+                (my $resolution := self.resolution) && nqp::can($resolution, 'signature') ?? $resolution.signature.parameters !!
+                $!routine ?? $!routine.signature.parameters !! []);
+
+            my int $pos;
+
+            for self.IMPL-UNWRAP-LIST($parameters) -> $parameter {
+                my $arg := $args[$pos];
+                next if nqp::istype($arg, RakuAST::NamedArg);
+                if nqp::istype($arg, RakuAST::Literal) {
+                    my $target := $parameter.target;
+
+                    # for 'sub (Int $ is rw, int $a is rw, int :$n, int :$m) {}(:n(3), 2, :m(4), 4)', see RakuAST::ApplyPostfix.
+                    # sub f(Int $ is rw, int $a is rw, int :$n, int :$m) {}; f(:n(3), 2, :m(4), 4)
+                    # NOTICE: Changes here may be synced to RakuAST::ApplyPostfix too.
+                    if $target.can-be-assigned-to || $target.can-be-bound-to {
+                        self.add-sorry:
+                            $resolver.build-exception: 'X::Parameter::RW', :got($arg.maybe-compile-time-value), :symbol($target.name)
+                    }
+                }
+                ++$pos
+            }
+
             self.add-sorry(
                 $resolver.build-exception: 'X::Comp::AdHoc',
                     payload => "No return arguments allowed when return value {$block.signature.returns.DEPARSE} is already specified in the signature",
-            );
-        }
-
-        unless self.is-resolved {
-            self.PERFORM-BEGIN($resolver, $context);
+            ) if $!name.canonicalize eq 'return' && (my $ret := $block.signature.returns) && $ret.has-compile-time-value
+                && (nqp::isconcrete($ret.maybe-compile-time-value) || nqp::istype($ret.maybe-compile-time-value, Nil));
         }
 
         if self.is-resolved && (

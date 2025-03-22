@@ -3128,20 +3128,86 @@ class RakuAST::ApplyPostfix
     }
 
     method PERFORM-CHECK(Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
-        #  ApplyPostfix  ⎡(...)⎤
-        #    Block  ⎡{*.{}}⎤
-        #      Blockoid 𝄞 -e:1 ⎡{*.{}}⎤
-        #        StatementList 𝄞 -e:1 ⎡*.{}⎤
-        #          Statement::Expression ▪𝄞 -e:1 ⎡*.{}⎤
-        #            ... [curried]
-        #    Call::Term  ⎡(...)⎤
-        #      ArgList  ⎡...⎤
-        if nqp::istype($!operand, RakuAST::Block) && nqp::istype($!postfix, RakuAST::Call::Term) {
-            my $stmts := $!operand.body.statement-list;
-            if $stmts.IMPL-IS-SINGLE-EXPRESSION && $stmts.code-statements[0].expression.IMPL-CURRIED {
-                self.add-sorry:
-                    $resolver.build-exception: 'X::Syntax::Malformed',
-                        :what('double closure; WhateverCode is already a closure without curlies, so either remove the curlies or use valid parameter syntax instead of *')
+        my $postfix := $!postfix;
+
+        if nqp::istype($postfix, RakuAST::Call::Term) {
+            my $operand := $!operand;
+
+            #  ApplyPostfix  ⎡(...)⎤
+            #    Block  ⎡{*.{}}⎤
+            #      Blockoid 𝄞 -e:1 ⎡{*.{}}⎤
+            #        StatementList 𝄞 -e:1 ⎡*.{}⎤
+            #          Statement::Expression ▪𝄞 -e:1 ⎡*.{}⎤
+            #            ... [curried]
+            #    Call::Term  ⎡(...)⎤
+            #      ArgList  ⎡...⎤
+            if nqp::istype($operand, RakuAST::Block) {
+                my $stmts := $operand.body.statement-list;
+                if $stmts.IMPL-IS-SINGLE-EXPRESSION && $stmts.code-statements[0].expression.IMPL-CURRIED {
+                    self.add-sorry:
+                        $resolver.build-exception: 'X::Syntax::Malformed',
+                            :what('double closure; WhateverCode is already a closure without curlies, so either remove the curlies or use valid parameter syntax instead of *')
+                }
+            }
+            if nqp::istype($operand, RakuAST::Code) {
+                my $args := self.IMPL-UNWRAP-LIST($postfix.args.args);
+                my int $pos;
+                my int $has-slurpy;
+                my int $count;
+                my int $arity;
+
+                for self.IMPL-UNWRAP-LIST($operand.signature.parameters) -> $parameter {
+                    $has-slurpy := 1 unless $parameter.slurpy =:= RakuAST::Parameter::Slurpy;
+
+                    if !($parameter.slurpy =:= RakuAST::Parameter::Slurpy) {
+                        $has-slurpy := 1;
+                    } elsif $parameter.is-declared-optional {
+                        ++$count;
+                    } elsif $parameter.is-declared-required {
+                        ++$count;
+                        ++$arity;
+                    }
+
+
+                    my $arg := $args[$pos];
+                    break unless $arg;
+                    next if nqp::istype($arg, RakuAST::NamedArg);
+                    if nqp::istype($arg, RakuAST::Literal) {
+                        my $target := $parameter.target;
+
+                        # for 'sub f(Int $ is rw, int $a is rw, int :$n, int :$m) {}; f(:n(3), 2, :m(4), 4)', see RakuAST::Call::Name.
+                        # sub (Int $ is rw, int $a is rw, int :$n, int :$m) {}(:n(3), 2, :m(4), 4)
+                        # NOTICE: Changes here may be synced to RakuAST::Call::Name too.
+                        if $target.can-be-assigned-to || $target.can-be-bound-to {
+                            self.add-sorry:
+                                $resolver.build-exception: 'X::Parameter::RW', :got($arg.maybe-compile-time-value), :symbol($target.name)
+                        }
+                    }
+                    ++$pos
+                }
+
+                my $num_pos_args;
+                for $args -> $arg {
+                    ++$num_pos_args unless nqp::istype($arg, RakuAST::NamedArg);
+                }
+
+                my str $s := $arity == 1 ?? "" !! "s";
+                if $arity > $num_pos_args {
+                    # XXX: Please someone checks if these are the same as bootstrap.c/BOOTSTRAP.nqp.
+                    # XXX: add sorry here.
+                    nqp::die("too few positionals passed to '{$operand.name.canonicalize}'; expected $arity argument$s but got $num_pos_args")
+                        if $arity == $count;
+
+                    nqp::die("too few positionals passed to '{$operand.name.canonicalize}'; expected at least $arity argument$s but got only $num_pos_args")
+                        if $arity < $count;
+                } elsif $arity < $num_pos_args {
+                    nqp::die("too many positionals passed to '{$operand.name.canonicalize}'; expected $arity argument$s but got $num_pos_args")
+                        unless $has-slurpy;
+                } else {
+                    # XXX: don't how to check this. Copied from bootstrap.c/BOOTSTRAP.nqp
+                    # my str $conj := $count == $arity + 1 ?? "or" !! "to";
+                    # return "$error_prefix positionals passed to '$routine'; expected $arity $conj $count arguments but got $num_pos_args";
+                }
             }
         }
     }
