@@ -1269,7 +1269,7 @@ class Raku::Actions is HLL::Actions does Raku::CommonActions {
                 if $<dotty> && $<dotty><sym> eq '.=' {
                     my $infix := Nodify('DottyInfix', 'CallAssign').new;
                     self.SET-NODE-ORIGIN($<dotty><sym>, $infix);
-                    $ast.set-dispatcher(''); # Already handled by DottyInfix::CallAssign
+                    $ast.set-dispatcher('') if nqp::istype($ast, Nodify('Call', 'Methodish')); # Already handled by DottyInfix::CallAssign
                     my $node := Nodify('ApplyDottyInfix').new:
                         :$infix,
                         :left($operand),
@@ -1283,12 +1283,20 @@ class Raku::Actions is HLL::Actions does Raku::CommonActions {
                     $node.to-begin-time($*R, $cu ?? $cu.context !! NQPMu);
                     make $node;
                 }
-                elsif nqp::istype($operand, Nodify('Var', 'Attribute', 'Public')) && !$operand.has-args
-                    && nqp::istype($ast, Nodify('Call', 'Term'))
+                elsif nqp::istype($operand, Nodify('VarDeclaration', 'Anonymous')) && nqp::istype($ast, Nodify('Call', 'MetaMethod'))
                 {
-                    # A call like $.foo(1), just need to shuffle the args into the existing call
-                    $operand.replace-args($ast.args);
-                    self.attach: $/, $operand;
+                    # A call like $.^foo. Parses completely differently from $.foo
+                    self.attach: $/, Nodify('ApplyPostfix').new(
+                        operand => Nodify('ApplyPostfix').new(
+                            operand => Nodify('Term', 'Self').new.to-begin-time($*R, $*CU.context),
+                            postfix => $ast
+                        ).to-begin-time($*R, $*CU.context),
+                        postfix => Nodify('Call', 'Method').new(
+                            name => Nodify('Name').from-identifier(
+                                $operand.sigil eq '@' ?? 'list' !! $operand.sigil eq '%' ?? 'hash' !! 'item'
+                            ).to-begin-time($*R, $*CU.context)
+                        ).to-begin-time($*R, $*CU.context)
+                    );
                 }
                 else {
                     self.attach: $/, Nodify('ApplyPostfix').new:
@@ -1509,6 +1517,7 @@ class Raku::Actions is HLL::Actions does Raku::CommonActions {
             }
         }
         elsif $<quote> {
+            $dispatch := '!' if $DOTTY eq '!';
             $ast := Nodify('Call','QuotedMethod').new(
               :name($<quote>.ast), :$args, :$dispatch
             );
@@ -1938,15 +1947,32 @@ class Raku::Actions is HLL::Actions does Raku::CommonActions {
     method term:sym<identifier>($/) {
         my $args := $<args>.ast;
         my $name := $<identifier>.core2ast;
-        self.attach: $/, (my $invocant := $args.invocant)
+        if (my $invocant := $args.invocant) {
             # Indirect method call syntax, e.g. key($pair:)
-            ?? Nodify('ApplyPostfix').new(
+            if $args.arity == 1 {
+                my $arg := $args.IMPL-UNWRAP-LIST($args.args)[0];
+                if nqp::istype($arg, Nodify('ApplyListInfix')) && nqp::istype($arg.infix, Nodify('Infix')) && $arg.infix.operator eq ',' {
+                    # Need to unpack the actual argument list:
+                    # ArgList  ⎡$o: 1, 2⎤
+                    #   Var::Lexical 【$o】  ⎡$o⎤
+                    #   ApplyListInfix  ⎡,⎤
+                    #     Infix 【,】  ⎡,⎤
+                    #     IntLiteral  ⎡1⎤
+                    #     IntLiteral  ⎡2⎤
+                    $args.replace-args($arg.operands);
+                }
+            }
+            self.attach: $/, Nodify('ApplyPostfix').new(
                 operand => $invocant,
                 postfix => Nodify('Call', 'Method').new(:$name, :$args)
             )
-            !! Nodify('Call', 'Name').new:
-              name => $name,
-              args => $args,
+        }
+        else {
+            self.attach: $/, Nodify('Call', 'Name').new(
+                name => $name,
+                args => $args
+            )
+        }
     }
 
     method term:sym<nqp::op>($/) {
@@ -1976,16 +2002,32 @@ class Raku::Actions is HLL::Actions does Raku::CommonActions {
         else {
             if $<args> {
                 my $args := $<args>.ast;
-                self.attach: $/, (my $invocant := $args.invocant)
-                  # Indirect method call syntax, e.g. new Int: 1
-                  ?? Nodify('ApplyPostfix').new(
-                       operand => $invocant,
-                       postfix => Nodify('Call','Method').new(:$name, :$args)
-                     )
-                  # Normal named call
-                  !! $name.is-identifier && !$name.has-colonpairs
-                    ?? Nodify('Call','Name','WithoutParentheses').new(:$name, :$args)
-                    !! Nodify('Call','Name').new(:$name, :$args)
+                if (my $invocant := $args.invocant) {
+                    # Indirect method call syntax, e.g. new Int: 1
+                    if $args.arity == 1 {
+                        my $arg := $args.IMPL-UNWRAP-LIST($args.args)[0];
+                        if nqp::istype($arg, Nodify('ApplyListInfix')) && nqp::istype($arg.infix, Nodify('Infix')) && $arg.infix.operator eq ',' {
+                            # Need to unpack the actual argument list:
+                            # ArgList  ⎡$o: 1, 2⎤
+                            #   Var::Lexical 【$o】  ⎡$o⎤
+                            #   ApplyListInfix  ⎡,⎤
+                            #     Infix 【,】  ⎡,⎤
+                            #     IntLiteral  ⎡1⎤
+                            #     IntLiteral  ⎡2⎤
+                            $args.replace-args($arg.operands);
+                        }
+                    }
+                    self.attach: $/, Nodify('ApplyPostfix').new(
+                        operand => $invocant,
+                        postfix => Nodify('Call','Method').new(:$name, :$args)
+                    )
+                }
+                else {
+                    # Normal named call
+                    self.attach: $/, $name.is-identifier && !$name.has-colonpairs
+                        ?? Nodify('Call','Name','WithoutParentheses').new(:$name, :$args)
+                        !! Nodify('Call','Name').new(:$name, :$args)
+                }
             }
             else {
                 self.attach: $/, $*IS-TYPE
@@ -2162,7 +2204,8 @@ class Raku::Actions is HLL::Actions does Raku::CommonActions {
             $ast := Nodify('Var','Attribute').new($name);
         }
         elsif $twigil eq '.' {
-            $ast := Nodify('Var','Attribute','Public').new($name);
+            my $args := $<arglist> ?? $<arglist>.ast !! Nodify('ArgList');
+            $ast := Nodify('Var','Attribute','Public').new(:$name, :$args);
         }
         elsif $twigil eq '?' {
             my $origin-source := $*ORIGIN-SOURCE;

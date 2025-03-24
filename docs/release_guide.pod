@@ -74,7 +74,7 @@ modules are there and manually check them for false positives.
 
 Possible false positives are:
 
-* Modules related to async sometimes have flapping tests, such as C<Test::Async> etc.
+* Modules related to async sometimes have flapping tests
 * The C<November> module
 
 If the module installs fine on the latest Rakudo built from HEAD
@@ -594,6 +594,7 @@ Previous releases were bundled as part of monthly Parrot releases.
   2024-12-14   Rakudo #178 "2024.12"           (jdv)
   2025-01-25   Rakudo #179 "2025.01"           (Coke)
   2025-02-22   Rakudo #180 "2025.02"           (jdv)
+  2025-03-23   Rakudo #181 "2025.03"           (Coke)
 
 =head1 COPYRIGHT
 

@@ -42,6 +42,11 @@ class RakuAST::ArgList
         Nil
     }
 
+    method replace-args(List @args) {
+        nqp::bindattr(self, RakuAST::ArgList, '$!args', self.IMPL-UNWRAP-LIST(@args));
+        Nil
+    }
+
     method set-on-return(Bool $on-return) {
         nqp::bindattr(self, RakuAST::ArgList, '$!on-return', $on-return);
     }
@@ -57,7 +62,8 @@ class RakuAST::ArgList
         }
     }
 
-    method has-args() { nqp::elems($!args) }
+    method has-args() { nqp::elems($!args) ?? True !! False }
+    method arity() { nqp::elems($!args) }
 
     method args() {
         self.IMPL-WRAP-LIST($!args)
@@ -347,7 +353,7 @@ class RakuAST::Call::Name
 
             self.add-sorry(
                 $resolver.build-exception: 'X::Comp::AdHoc',
-                    payload => "No return arguments allowed when return value {$block.signature.returns.DEPARSE} is already specified in the signature",
+                    payload => "No return arguments allowed when return value {$ret.DEPARSE} is already specified in the signature",
             ) if $!name.canonicalize eq 'return' && (my $ret := $block.signature.returns) && $ret.has-compile-time-value
                 && (nqp::isconcrete($ret.maybe-compile-time-value) || nqp::istype($ret.maybe-compile-time-value, Nil));
         }
@@ -708,20 +714,38 @@ class RakuAST::Call::Method
                 $name := @parts[ nqp::elems(@parts)-1 ];
                 my $dispatcher := self.dispatcher;
 
-                $call := $dispatcher
-                  ?? QAST::Op.new:
-                       :op('callmethod'),
-                       :name($dispatcher),
-                       QAST::SVal.new( :value('dispatch:<::>') ),
-                       $invocant-qast,
-                       QAST::SVal.new(:value($name)),
-                       QAST::WVal.new(:value($Qualified))
-                  !! QAST::Op.new:
-                       :op('callmethod'),
-                       :name('dispatch:<::>'),
-                       $invocant-qast,
-                       QAST::SVal.new(:value($name)),
-                       QAST::WVal.new(:value($Qualified));
+                if $dispatcher {
+                    $call := QAST::Op.new:
+                        :op('callmethod'),
+                        :name($dispatcher),
+                        QAST::SVal.new( :value('dispatch:<::>') ),
+                        $invocant-qast,
+                        QAST::SVal.new(:value($name)),
+                        QAST::WVal.new(:value($Qualified));
+                }
+                else {
+                    my $temp := QAST::Node.unique('inv_once');
+                    my $stmts := QAST::Stmts.new(
+                        QAST::Op.new(
+                            :op('bind'),
+                            QAST::Var.new( :name($temp), :scope('local'), :decl('var') ),
+                            $invocant-qast
+                        ),
+                        $call := QAST::Op.new(
+                            :op('dispatch'),
+                            QAST::SVal.new( :value('raku-meth-call-qualified') ),
+                            QAST::Op.new(
+                                :op('decont'),
+                                QAST::Var.new( :name($temp), :scope('local') ),
+                            ),
+                            QAST::SVal.new(:value($name)),
+                            QAST::WVal.new(:value($Qualified)),
+                            QAST::Var.new( :name($temp), :scope('local') ),
+                        )
+                    );
+                    self.args.IMPL-ADD-QAST-ARGS($context, $call);
+                    return $stmts;
+                }
             }
         }
         else {
@@ -847,6 +871,12 @@ class RakuAST::Call::Method
                 macro => $!name.canonicalize;
         }
 
+        if self.macroish && self.dispatcher {
+            self.add-sorry:
+              $resolver.build-exception: 'X::AdHoc',
+                  payload => 'Cannot use ' ~ self.dispatch ~ ' on a non-identifier method call';
+        }
+
         if $!name && $!name.is-multi-part {
             my $Qualified := self.IMPL-UNWRAP-LIST(self.get-implicit-lookups)[0];
             unless $Qualified.is-resolved {
@@ -864,6 +894,7 @@ class RakuAST::Call::QuotedMethod
   is RakuAST::BeginTime
 {
     has RakuAST::QuotedString   $.name;
+    has Mu $!package;
 
     method new(
       RakuAST::QuotedString :$name!,
@@ -889,6 +920,7 @@ class RakuAST::Call::QuotedMethod
     method can-be-used-with-hyper() { True }
 
     method PERFORM-BEGIN(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
+        nqp::bindattr(self, RakuAST::Call::QuotedMethod, '$!package', $resolver.current-package);
         my $routine := $resolver.find-attach-target('routine');
         if $routine {
             $routine.set-may-use-return(True);
@@ -900,7 +932,9 @@ class RakuAST::Call::QuotedMethod
         my $dispatcher := self.dispatcher;
 
         my $call := $dispatcher
-          ?? QAST::Op.new( :op('callmethod'), :name($dispatcher), $invocant-qast, $name-qast )
+          ?? $dispatcher eq 'dispatch:<!>'
+            ?? QAST::Op.new( :op('callmethod'), :name($dispatcher), $invocant-qast, $name-qast, QAST::WVal.new(:value($!package)) )
+            !! QAST::Op.new( :op('callmethod'), :name($dispatcher), $invocant-qast, $name-qast )
           !! QAST::Op.new( :op('callmethod'), $invocant-qast, $name-qast );
         self.args.IMPL-ADD-QAST-ARGS($context, $call);
         $call
@@ -962,6 +996,10 @@ class RakuAST::Call::PrivateMethod
 
     method needs-resolution() { False }
 
+    method can-be-used-with-hyper() {
+        $!name && $!name.is-multi-part
+    }
+
     method PERFORM-PARSE(RakuAST::Resolver $resolver, RakuAST::IMPL::QASTContext $context) {
         nqp::bindattr(self, RakuAST::Call::PrivateMethod, '$!package', $resolver.current-package);
         if $!name.is-multi-part {
@@ -993,6 +1031,19 @@ class RakuAST::Call::PrivateMethod
                     self.add-sorry:
                         $resolver.build-exception: 'X::Method::Private::Unqualified',
                             :method($!name.canonicalize);
+                }
+            }
+        }
+
+        if $!name.is-identifier {
+            my $name := self.IMPL-UNWRAP-LIST($!name.parts)[0].name;
+            my $package := $!package;
+            if nqp::can($package.HOW, 'archetypes') && !$package.HOW.archetypes.generic && !$package.HOW.archetypes.parametric && nqp::can($package.HOW, 'find_private_method') {
+                my $meth := $package.HOW.find_private_method($package, $name);
+                unless nqp::defined($meth) && $meth {
+                    self.add-sorry:
+                        $resolver.build-exception: 'X::Method::NotFound',
+                            :method($!name.canonicalize), :typename($package.HOW.name($package)), :private(True);
                 }
             }
         }
@@ -1040,6 +1091,24 @@ class RakuAST::Call::PrivateMethod
                 self.resolution.IMPL-TO-QAST($context),
             );
         }
+        self.args.IMPL-ADD-QAST-ARGS($context, $call);
+        $call
+    }
+
+    method IMPL-POSTFIX-HYPER-QAST(RakuAST::IMPL::QASTContext $context, Mu $operand-qast) {
+        my $name := $!name.canonicalize;
+        my $call;
+        my @parts := nqp::split('::', $name);
+
+        $name := @parts[ nqp::elems(@parts)-1 ];
+
+        $call := QAST::Op.new:
+            :op('callmethod'), :name('dispatch:<hyper>'),
+            $operand-qast,
+            QAST::SVal.new( :value($name) ),
+            QAST::SVal.new( :value('dispatch:<!>') ),
+            QAST::SVal.new( :value($name) ),
+            self.resolution.IMPL-TO-QAST($context);
         self.args.IMPL-ADD-QAST-ARGS($context, $call);
         $call
     }
