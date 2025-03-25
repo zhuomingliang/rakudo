@@ -353,18 +353,13 @@ class RakuAST::Call::Name
 
             self.add-sorry(
                 $resolver.build-exception: 'X::Comp::AdHoc',
-                    payload => "No return arguments allowed when return value {$ret.DEPARSE} is already specified in the signature",
+                    payload => "No return arguments allowed when return value {$block.signature.DEPARSE} is already specified in the signature",
             ) if $!name.canonicalize eq 'return' && (my $ret := $block.signature.returns) && $ret.has-compile-time-value
                 && (nqp::isconcrete($ret.maybe-compile-time-value) || nqp::istype($ret.maybe-compile-time-value, Nil));
         }
 
-        if self.is-resolved && (
-            nqp::istype(self.resolution, RakuAST::CompileTimeValue)
-            || nqp::can(self.resolution, 'maybe-compile-time-value')
-        ) {
-            my $routine := nqp::istype(self.resolution, RakuAST::CompileTimeValue)
-                ?? self.resolution.compile-time-value
-                !! self.resolution.maybe-compile-time-value;
+        if self.is-resolved && nqp::istype(self.resolution, RakuAST::CompileTimeValue) {
+            my $routine := self.resolution.maybe-compile-time-value;
             if nqp::isconcrete($routine) && nqp::istype($routine, Code) && nqp::can($routine, 'signature') {
                 my $sig := $routine.signature;
                 my @types;

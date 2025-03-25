@@ -41,6 +41,10 @@ class RakuAST::Node {
     # that it appears in a sink context.
     method needs-sink-call() { True }
 
+    # Returns True if the expression is something that can be assigned to,
+    # and False otherwise.
+    method can-be-assigned-to() { True }
+
     # Returns True if the expression is something that can be bound to,
     # and False otherwise.
     method can-be-bound-to() { False }
