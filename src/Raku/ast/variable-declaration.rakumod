@@ -686,6 +686,8 @@ class RakuAST::VarDeclaration::Simple
         }
     }
 
+    method can-be-assigned-to() { True }
+
     method can-be-bound-to() {
         # Must be lexical and non-native.
         if $!is-bindable && (self.scope eq 'my' || self.scope eq 'our' || self.scope eq 'state') {

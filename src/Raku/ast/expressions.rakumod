@@ -1996,7 +1996,7 @@ class RakuAST::ApplyInfix
 
         # a "normal" infix op
         elsif nqp::istype($infix, RakuAST::Infix) {
-            if $infix.operator eq '=' && !$left.can-be-assigned-to {
+            if $infix.operator eq '=' && nqp::can(!$left, 'can-be-assigned-to') && !$left.can-be-assigned-to {
                 self.add-sorry: $left.build-assign-exception($resolver);
             }
 
